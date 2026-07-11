@@ -49,6 +49,7 @@ MAX_BET = 5000.00
 
 MIN_DEPOSIT = 3.00
 MIN_WITHDRAW = 10.00
+MIN_TIP = 0.50
 FIRST_DEPOSIT_BONUS_PCT = 1.30     # 130% match on the very first deposit
 BONUS_WAGER_MULTIPLIER = 50        # bonus funds need 50x wagered before withdrawal
 DEPOSIT_WAGER_MULTIPLIER = 1       # every deposit needs 1x wagered before ANY withdrawal
@@ -58,6 +59,20 @@ pending_bets = {}
 active_mines_games = {}
 active_towers_games = {}
 active_keno_games = {}
+
+# Per-user preferred display currency (balance is always tracked internally
+# in USD - this only affects how it's *shown*, converted at a cached live
+# rate). Defaults to "usd" for anyone who hasn't picked one.
+user_display_currency = {}
+CURRENCY_LOCK = threading.Lock()
+known_usernames = {}  # lowercased @username (no @) -> user_id, for /tip lookups
+SUPPORTED_CURRENCIES = {
+    "usd": {"label": "USD", "emoji": "💵", "decimals": 2},
+    "inr": {"label": "INR", "emoji": "🇮🇳", "decimals": 2},
+    "ltc": {"label": "LTC", "emoji": "⚪", "decimals": 6},
+}
+_rate_cache = {"usd_inr": None, "usd_ltc": None, "fetched_at": 0}
+_RATE_CACHE_TTL = 300  # seconds
 active_crash_games = {}   # token -> game dict
 user_active_crash = {}    # user_id -> token (one live crash round per user)
 client_seeds = {}         # user_id -> client seed string (provably fair)
@@ -159,6 +174,83 @@ def get_wallet_breakdown(user_id):
     with WALLET_LOCK:
         w = _ensure_wallet(user_id)
         return dict(w)
+
+
+def _fetch_exchange_rates():
+    """Refresh the USD->INR and USD->LTC cached rates. Best-effort - on any
+    failure the stale cached values (or None on first-ever failure) are
+    left in place, so a network hiccup degrades to 'last known rate'
+    rather than breaking the /balance display."""
+    try:
+        resp = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=8)
+        data = resp.json()
+        rate = data.get("rates", {}).get("INR")
+        if rate:
+            _rate_cache["usd_inr"] = float(rate)
+    except Exception as e:
+        print(f"⚠️ Could not refresh USD/INR rate: {e}")
+
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd",
+            timeout=8,
+        )
+        data = resp.json()
+        ltc_usd_price = data.get("litecoin", {}).get("usd")
+        if ltc_usd_price:
+            _rate_cache["usd_ltc"] = 1 / float(ltc_usd_price)  # how many LTC per 1 USD
+    except Exception as e:
+        print(f"⚠️ Could not refresh USD/LTC rate: {e}")
+
+    _rate_cache["fetched_at"] = time.time()
+
+
+def _get_rates():
+    if time.time() - _rate_cache["fetched_at"] > _RATE_CACHE_TTL:
+        _fetch_exchange_rates()
+    return _rate_cache
+
+
+def get_user_currency(user_id):
+    with CURRENCY_LOCK:
+        return user_display_currency.get(user_id, "usd")
+
+
+def set_user_currency(user_id, currency):
+    with CURRENCY_LOCK:
+        user_display_currency[user_id] = currency
+
+
+def fmt_balance(user_id, usd_amount=None):
+    """Format a USD balance in the user's preferred display currency.
+    Pass usd_amount explicitly to convert an arbitrary figure (e.g. a bet
+    result); omit it to format the user's current wallet balance."""
+    if usd_amount is None:
+        usd_amount = get_balance(user_id)
+
+    currency = get_user_currency(user_id)
+    meta = SUPPORTED_CURRENCIES[currency]
+
+    if currency == "usd":
+        value = usd_amount
+    elif currency == "inr":
+        rates = _get_rates()
+        rate = rates["usd_inr"]
+        if not rate:
+            # Rate unavailable (never fetched successfully) - fall back to
+            # USD rather than showing a wrong/zero number.
+            return f"${usd_amount:.2f} (INR rate unavailable)"
+        value = usd_amount * rate
+    elif currency == "ltc":
+        rates = _get_rates()
+        rate = rates["usd_ltc"]
+        if not rate:
+            return f"${usd_amount:.2f} (LTC rate unavailable)"
+        value = usd_amount * rate
+    else:
+        value = usd_amount
+
+    return f"{meta['emoji']} {value:.{meta['decimals']}f} {meta['label']}"
 
 
 def spend_for_bet(user_id, amount):
@@ -264,6 +356,33 @@ def get_withdrawable_balance(user_id):
         if w["deposit_wager_required"] > 0:
             return 0.0
         return w["real"]
+
+
+def process_tip(sender_id, recipient_id, amount):
+    """Moves `amount` from sender's REAL balance (never bonus - bonus can't
+    be tipped) into recipient's real balance. If the sender's own deposit
+    hasn't been fully wagered yet (deposit_wager_required > 0), that
+    "unwagered" status carries over to the recipient for this amount - they
+    now need to wager it 1x before it (or anything won with it) can be
+    withdrawn, same as if they'd deposited it themselves. If the sender's
+    funds were already fully wagered/clean, the tip arrives clean with no
+    new requirement for the recipient. Returns (ok, reason)."""
+    with WALLET_LOCK:
+        sw = _ensure_wallet(sender_id)
+        if amount > sw["real"] + 1e-9:
+            return False, "insufficient_real"
+
+        sw["real"] = round(sw["real"] - amount, 2)
+        sender_unwagered = sw["deposit_wager_required"] > 0
+        _persist_wallet(sender_id)
+
+        rw = _ensure_wallet(recipient_id)
+        rw["real"] = round(rw["real"] + amount, 2)
+        if sender_unwagered:
+            rw["deposit_wager_required"] = round(rw["deposit_wager_required"] + amount, 2)
+        _persist_wallet(recipient_id)
+
+        return True, "unwagered" if sender_unwagered else "clean"
 
 # Public HTTPS base URL the bot is reachable at, used to build the Crash
 # Mini App link (Telegram requires an https:// URL for web_app buttons).
@@ -1604,6 +1723,29 @@ def handle_callback(callback_query):
 
     parts = data.split(":")
     action = parts[0]
+
+    if action == "curr":
+        chosen = parts[1] if len(parts) > 1 else "usd"
+        if chosen not in SUPPORTED_CURRENCIES:
+            answer_callback(callback_id, "Unknown currency.", show_alert=True)
+            return
+        set_user_currency(clicking_user_id, chosen)
+        meta = SUPPORTED_CURRENCIES[chosen]
+        answer_callback(callback_id, f"Display currency set to {meta['label']}")
+        current = chosen
+        buttons = [[{
+            "text": f"{m['emoji']} {m['label']}" + (" ✅" if code == current else ""),
+            "callback_data": f"curr:{code}"
+        } for code, m in SUPPORTED_CURRENCIES.items()]]
+        edit_message(
+            chat_id, message_id,
+            f"💱 <b>Display Currency</b>\n\n"
+            f"Your balance is always tracked in USD internally - this just changes "
+            f"how it's <i>shown</i> to you, converted at the current rate.\n\n"
+            f"Current: <b>{meta['label']}</b>",
+            reply_markup={"inline_keyboard": buttons}
+        )
+        return
 
     if action == "fair":
         token = parts[1] if len(parts) > 1 else ""
@@ -3819,6 +3961,10 @@ def handle_message(message):
     user_id = message["from"]["id"]
     text = message.get("text", "").strip()
 
+    uname = message["from"].get("username")
+    if uname:
+        known_usernames[uname.lower()] = user_id
+
     if check_for_custom_emoji_ids(message):
         return
 
@@ -4127,8 +4273,72 @@ def handle_message(message):
             chat_id,
             f'<tg-emoji emoji-id="5264895611517300926">💰</tg-emoji> '
             f'<tg-emoji emoji-id="5472250091332993630">💸</tg-emoji> '
-            f"{mention(user_id, name)} balance: <b>${bal:.2f}</b>",
+            f"{mention(user_id, name)} balance: <b>${bal:.2f}</b> ({fmt_balance(user_id, bal)})",
             reply_markup=balance_action_keyboard()
+        )
+        return
+
+    if command == "/currency":
+        current = get_user_currency(user_id)
+        buttons = [[{
+            "text": f"{meta['emoji']} {meta['label']}" + (" ✅" if code == current else ""),
+            "callback_data": f"curr:{code}"
+        } for code, meta in SUPPORTED_CURRENCIES.items()]]
+        send_message(
+            chat_id,
+            f"💱 <b>Display Currency</b>\n\n"
+            f"Your balance is always tracked in USD internally - this just changes "
+            f"how it's <i>shown</i> to you, converted at the current rate.\n\n"
+            f"Current: <b>{SUPPORTED_CURRENCIES[current]['label']}</b>",
+            reply_markup={"inline_keyboard": buttons}
+        )
+        return
+
+    if command == "/tip":
+        # Deliberately NOT listed in /help or the Telegram command menu.
+        if not args:
+            send_message(chat_id, f"{WARN_EMOJI} Usage: reply to their message with <code>/tip 1</code>, or <code>/tip 1 @username</code>.")
+            return
+        try:
+            amount = round(float(args[0]), 2)
+        except ValueError:
+            send_message(chat_id, f"{WARN_EMOJI} Please give a plain number, e.g. <code>/tip 1</code>")
+            return
+        if amount < MIN_TIP:
+            send_message(chat_id, f"{WARN_EMOJI} Minimum tip is ${MIN_TIP:.2f}")
+            return
+
+        recipient_id = None
+        recipient_name = None
+        reply_msg = message.get("reply_to_message")
+        if reply_msg and reply_msg.get("from") and not reply_msg["from"].get("is_bot"):
+            recipient_id = reply_msg["from"]["id"]
+            recipient_name = reply_msg["from"].get("first_name", "Player")
+        elif len(args) > 1 and args[1].startswith("@"):
+            uname = args[1][1:].lower()
+            recipient_id = known_usernames.get(uname)
+            recipient_name = args[1]
+            if not recipient_id:
+                send_message(chat_id, f"{WARN_EMOJI} Can't find @{args[1][1:]} - they need to have messaged in here at least once.")
+                return
+        else:
+            send_message(chat_id, f"{WARN_EMOJI} Reply to their message with <code>/tip {amount}</code>, or use <code>/tip {amount} @username</code>.")
+            return
+
+        if recipient_id == user_id:
+            send_message(chat_id, f"{WARN_EMOJI} You can't tip yourself.")
+            return
+
+        ok, reason = process_tip(user_id, recipient_id, amount)
+        if not ok:
+            send_message(chat_id, f"{WARN_EMOJI} Not enough non-bonus balance to tip that much - bonus funds can't be tipped.")
+            return
+
+        name = message["from"].get("first_name", "Player")
+        note = " (they'll need to wager it 1x before withdrawing it)" if reason == "unwagered" else ""
+        send_message(
+            chat_id,
+            f"🎁 {mention(user_id, name)} tipped {mention(recipient_id, recipient_name)} <b>${amount:.2f}</b>!{note}"
         )
         return
 
@@ -5110,6 +5320,7 @@ def main():
             {"command": "deposit", "description": "Fund your account (crypto)"},
             {"command": "withdraw", "description": "Withdraw your balance"},
             {"command": "balance", "description": "Check your balance"},
+            {"command": "currency", "description": "Set display currency (USD/INR/LTC)"},
             {"command": "blackjack", "description": "Play Blackjack"},
             {"command": "dice", "description": "Play Dice"},
             {"command": "crash", "description": "Play Crash"},
