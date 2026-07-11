@@ -67,9 +67,9 @@ user_display_currency = {}
 CURRENCY_LOCK = threading.Lock()
 known_usernames = {}  # lowercased @username (no @) -> user_id, for /tip lookups
 SUPPORTED_CURRENCIES = {
-    "usd": {"label": "USD", "emoji": "💵", "decimals": 2},
-    "inr": {"label": "INR", "emoji": "🇮🇳", "decimals": 2},
-    "ltc": {"label": "LTC", "emoji": "⚪", "decimals": 6},
+    "usd": {"label": "USD", "emoji": "💵", "decimals": 2, "icon_id": "5409048419211682843"},
+    "inr": {"label": "INR", "emoji": "🇮🇳", "decimals": 2, "icon_id": "5296467211735539812"},
+    "ltc": {"label": "LTC", "emoji": "⚪", "decimals": 6, "icon_id": "5080170678729049007"},
 }
 _rate_cache = {"usd_inr": None, "usd_ltc": None, "fetched_at": 0}
 _RATE_CACHE_TTL = 300  # seconds
@@ -615,12 +615,12 @@ NOWPAYMENTS_2FA_SECRET = os.environ.get("NOWPAYMENTS_2FA_SECRET", "")
 
 # code shown to the player -> exact NowPayments pay_currency code
 DEPOSIT_COINS = {
-    "usdttrc20": {"label": "USDT (TRC-20)", "emoji": "🟢"},
-    "usdtbsc":   {"label": "USDT (BEP-20)", "emoji": "🟡"},
-    "btc":       {"label": "Bitcoin",       "emoji": "🟠"},
-    "eth":       {"label": "Ethereum",      "emoji": "🔷"},
-    "ltc":       {"label": "Litecoin",      "emoji": "⚪"},
-    "trx":       {"label": "TRON",          "emoji": "🔴"},
+    "usdttrc20": {"label": "USDT (TRC-20)", "emoji": "🟢", "icon_id": "5080152738650653521"},
+    "usdtbsc":   {"label": "USDT (BEP-20)", "emoji": "🟡", "icon_id": "5080264137217409933"},
+    "btc":       {"label": "Bitcoin",       "emoji": "🟠", "icon_id": "5080441454942225477"},
+    "eth":       {"label": "Ethereum",      "emoji": "🔷", "icon_id": "5080063484935275722"},
+    "ltc":       {"label": "Litecoin",      "emoji": "⚪", "icon_id": "5080170678729049007"},
+    "trx":       {"label": "TRON",          "emoji": "🔴", "icon_id": "5080152738650653521"},
 }
 
 pending_deposits = {}      # nowpayments payment_id -> {"user_id", "usd_amount", "coin"}
@@ -755,7 +755,11 @@ def deposit_coin_keyboard():
     rows = []
     row = []
     for code, meta in DEPOSIT_COINS.items():
-        row.append({"text": f"{meta['emoji']} {meta['label']}", "callback_data": f"dep_coin:{code}"})
+        row.append({
+            "text": meta["label"],
+            "callback_data": f"dep_coin:{code}",
+            "icon_custom_emoji_id": meta["icon_id"],
+        })
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -768,7 +772,11 @@ def withdraw_coin_keyboard():
     rows = []
     row = []
     for code, meta in DEPOSIT_COINS.items():
-        row.append({"text": f"{meta['emoji']} {meta['label']}", "callback_data": f"wd_coin:{code}"})
+        row.append({
+            "text": meta["label"],
+            "callback_data": f"wd_coin:{code}",
+            "icon_custom_emoji_id": meta["icon_id"],
+        })
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -1763,8 +1771,9 @@ def handle_callback(callback_query):
         answer_callback(callback_id, f"Display currency set to {meta['label']}")
         current = chosen
         buttons = [[{
-            "text": f"{m['emoji']} {m['label']}" + (" ✅" if code == current else ""),
-            "callback_data": f"curr:{code}"
+            "text": m['label'] + (" ✅" if code == current else ""),
+            "callback_data": f"curr:{code}",
+            "icon_custom_emoji_id": m["icon_id"],
         } for code, m in SUPPORTED_CURRENCIES.items()]]
         edit_message(
             chat_id, message_id,
@@ -4274,8 +4283,8 @@ def handle_message(message):
     if command == "/help":
         send_message(
             chat_id,
-            f"📖 <b>Traqd Casino — Help</b>\n\n"
-            f"<b>💰 Wallet</b>\n"
+            f'<tg-emoji emoji-id="5361775397811795920">📖</tg-emoji> <b>Traqd Casino — Help</b>\n\n'
+            f'<b><tg-emoji emoji-id="5215420556089776398">💰</tg-emoji> Wallet</b>\n'
             f"/balance — check your balance\n"
             f"/deposit — deposit crypto (min ${MIN_DEPOSIT:.2f})\n"
             f"/withdraw — withdraw crypto (min ${MIN_WITHDRAW:.2f})\n\n"
@@ -4285,7 +4294,7 @@ def handle_message(message):
             f"Every deposit (bonus or not) also needs to be wagered "
             f"<b>{DEPOSIT_WAGER_MULTIPLIER}×</b> before any of your balance "
             f"can be withdrawn.\n\n"
-            f"<b>🎮 Games</b>\n"
+            f'<b><tg-emoji emoji-id="5361766739157730216">🎮</tg-emoji> Games</b>\n'
             f"/roulette &lt;amount&gt; — bet red/black/green, odds/evens, "
             f"dozens, or a single number\n"
             f"/blackjack &lt;amount&gt; — classic 21 vs the dealer, hit/stand/"
@@ -4303,9 +4312,9 @@ def handle_message(message):
             f"the multiplier\n\n"
             f"Most games open as an in-chat Mini App — tap the button the "
             f"bot sends after you run the command. Every result is provably "
-            f"fair; look for the 🔍 <b>Verify</b> button under each result "
+            f'fair; look for the <tg-emoji emoji-id="5443000797111528222">🔍</tg-emoji> <b>Verify</b> button under each result '
             f"to check it yourself.\n\n"
-            f"<b>👥 Groups</b>\n"
+            f'<b><tg-emoji emoji-id="5296533616224906961">👥</tg-emoji> Groups</b>\n'
             f"Every command above works in group chats too — each player's "
             f"bet is independent. Mini App games (Crash, Blackjack, Dice, "
             f"Chicken Road) send you a one-time link into DM since Telegram "
@@ -4329,8 +4338,9 @@ def handle_message(message):
     if command == "/currency":
         current = get_user_currency(user_id)
         buttons = [[{
-            "text": f"{meta['emoji']} {meta['label']}" + (" ✅" if code == current else ""),
-            "callback_data": f"curr:{code}"
+            "text": meta['label'] + (" ✅" if code == current else ""),
+            "callback_data": f"curr:{code}",
+            "icon_custom_emoji_id": meta["icon_id"],
         } for code, meta in SUPPORTED_CURRENCIES.items()]]
         send_message(
             chat_id,
