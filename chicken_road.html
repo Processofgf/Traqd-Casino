@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Chicken Road</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pixi.js/7.4.2/pixi.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700;800&family=Inter:wght@400;500;600;700;800&display=swap');
+
+  :root {
+    --void: #0b0e14;
+    --panel: #151a27;
+    --line: rgba(255,255,255,0.07);
+    --green: #00e701;
+    --red: #ff4d5e;
+    --gold: #ffc93c;
+    --mist: #7c8aa0;
+    --text: #eef1f8;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--void);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  #app { position: relative; height: 100dvh; width: 100vw; display: flex; flex-direction: column; }
+
+  #topbar {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 16px 0;
+    font-size: 11px; letter-spacing: 0.06em; color: var(--mist); text-transform: uppercase;
+  }
+  #topbar .brand { display: flex; align-items: center; gap: 7px; font-weight: 800; color: var(--text); font-size: 13px; }
+  #topbar .brand .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--gold); box-shadow: 0 0 8px var(--gold); }
+  #balance-pill {
+    background: var(--panel); border: 1px solid var(--line); padding: 7px 13px; border-radius: 100px;
+    font-family: 'JetBrains Mono', monospace; font-weight: 600; font-size: 13px; color: var(--gold);
+  }
+
+  #board-wrap {
+    position: relative;
+    flex: 1;
+    margin: 10px 12px 0;
+    border-radius: 22px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+  }
+  #board-wrap canvas { display: block; width: 100%; height: 100%; }
+
+  #cashout-readout {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    background: rgba(11,14,20,0.65);
+    border: 1px solid rgba(0,231,1,0.4);
+    border-radius: 100px;
+    padding: 6px 16px;
+    font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 13px;
+    color: var(--green);
+    display: none;
+  }
+
+  #result-banner {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    background: rgba(11,14,20,0.88);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 18px 26px;
+    text-align: center;
+    display: none;
+    z-index: 6;
+  }
+  #result-banner .title { font-size: 15px; font-weight: 800; margin-bottom: 4px; }
+  #result-banner .sub { font-size: 12px; color: var(--mist); }
+  #result-banner.win .title { color: var(--green); }
+  #result-banner.lose .title { color: var(--red); }
+
+  #idle-panel {
+    position: absolute; left: 12px; right: 12px; bottom: 12px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 12px;
+    display: flex; flex-direction: column; gap: 10px;
+    z-index: 5;
+  }
+  #idle-panel .row { display: flex; align-items: center; gap: 8px; }
+  #difficulty-select {
+    flex: 1;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  #bet-amount {
+    flex: 1;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .quick-btn {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-weight: 700;
+    font-size: 13px;
+  }
+
+  #actionbar { padding: 10px 12px 14px; display: flex; gap: 8px; }
+  .main-btn {
+    flex: 1;
+    padding: 15px;
+    border: none;
+    border-radius: 14px;
+    font-size: 15px;
+    font-weight: 800;
+    letter-spacing: 0.01em;
+  }
+  .btn-go { background: linear-gradient(135deg, #2f6feb, #1a4fc4); color: #fff; }
+  .btn-go:disabled { opacity: 0.5; }
+  .btn-next { background: linear-gradient(135deg, #2f6feb, #1a4fc4); color: #fff; }
+  .btn-cashout { background: linear-gradient(135deg, var(--gold), var(--green)); color: #10210a; }
+  .btn-again { background: linear-gradient(135deg, #2f6feb, #1a4fc4); color: #fff; }
+  .main-btn:disabled { opacity: 0.5; }
+
+  #error-toast {
+    position: absolute; bottom: 90px; left: 50%; transform: translateX(-50%);
+    background: rgba(255,77,94,0.16); border: 1px solid rgba(255,77,94,0.4); color: #ffd9de;
+    padding: 9px 14px; border-radius: 12px; font-size: 13px; text-align: center;
+    display: none; z-index: 7;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div id="topbar">
+    <div class="brand"><span class="dot"></span>CHICKEN ROAD</div>
+    <div id="balance-pill">$--.--</div>
+  </div>
+
+  <div id="board-wrap">
+    <div id="cashout-readout">Cash out now: <b>$0.00</b></div>
+    <div id="result-banner">
+      <div class="title" id="result-title"></div>
+      <div class="sub" id="result-sub"></div>
+    </div>
+
+    <div id="idle-panel">
+      <div class="row">
+        <select id="difficulty-select">
+          <option value="easy">Easy</option>
+          <option value="medium">Medium</option>
+          <option value="hard">Hard</option>
+          <option value="daredevil">Daredevil</option>
+        </select>
+      </div>
+      <div class="row">
+        <input id="bet-amount" type="number" inputmode="decimal" step="0.10" min="0.10" value="10.00" />
+        <button class="quick-btn" data-op="half">½</button>
+        <button class="quick-btn" data-op="double">2×</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="error-toast"></div>
+
+  <div id="actionbar">
+    <button id="btn-go" class="main-btn btn-go">Go</button>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  if (tg) { tg.ready(); tg.expand(); }
+  const initData = tg ? tg.initData : "";
+
+  const token = location.pathname.split("/").filter(Boolean).pop();
+  const params = new URLSearchParams(location.search);
+  const API_BASE = params.get("api") ? decodeURIComponent(params.get("api")) : "";
+
+  const el = {
+    balance: document.getElementById("balance-pill"),
+    boardWrap: document.getElementById("board-wrap"),
+    idlePanel: document.getElementById("idle-panel"),
+    difficultySelect: document.getElementById("difficulty-select"),
+    betAmount: document.getElementById("bet-amount"),
+    actionbar: document.getElementById("actionbar"),
+    btnGo: document.getElementById("btn-go"),
+    toast: document.getElementById("error-toast"),
+    cashoutReadout: document.getElementById("cashout-readout"),
+    resultBanner: document.getElementById("result-banner"),
+    resultTitle: document.getElementById("result-title"),
+    resultSub: document.getElementById("result-sub"),
+  };
+
+  document.querySelectorAll(".quick-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      let v = parseFloat(el.betAmount.value) || 0;
+      const op = btn.dataset.op;
+      if (op === "half") v = Math.max(0.10, v / 2);
+      else if (op === "double") v = v * 2;
+      el.betAmount.value = v.toFixed(2);
+    });
+  });
+
+  function showToast(msg) {
+    el.toast.textContent = msg;
+    el.toast.style.display = "block";
+    setTimeout(() => (el.toast.style.display = "none"), 2600);
+  }
+  function setBalance(v) { el.balance.textContent = "$" + Number(v).toFixed(2); }
+
+  async function apiPost(path, body) {
+    const res = await fetch(API_BASE + path, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Something went wrong");
+    return data;
+  }
+  async function apiGet(path) {
+    const res = await fetch(API_BASE + path, { cache: "no-store" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Something went wrong");
+    return data;
+  }
+
+  // =========================================================================
+  // BOARD — vector chicken/vehicles (no external images), camera-follow,
+  // daytime theme, squash-on-hit. Pure rendering; game truth lives on the
+  // server and arrives via renderBoardAtLane / animateHop.
+  // =========================================================================
+  const W = el.boardWrap.clientWidth, H = el.boardWrap.clientHeight;
+  const app = new PIXI.Application({ width: W, height: H, backgroundColor: 0x8ec9ef, antialias: true, resolution: window.devicePixelRatio || 1, autoDensity: true });
+  el.boardWrap.insertBefore(app.view, el.boardWrap.firstChild);
+
+  const camera = new PIXI.Container();
+  app.stage.addChild(camera);
+
+  let LANES = 12;
+  const LANE_W = 78;
+  const SIDEWALK_W = 40;
+  const ROAD_LEFT = SIDEWALK_W;
+
+  const bg = new PIXI.Graphics();
+  camera.addChild(bg);
+
+  function hazardStripes(g, x, y, w, h, dark, light) {
+    g.beginFill(dark);
+    g.drawRect(x, y, w, h);
+    g.endFill();
+    g.lineStyle(4, light, 0.9);
+    for (let i = -h; i < w + h; i += 16) {
+      g.moveTo(x + i, y);
+      g.lineTo(x + i - h, y + h);
+    }
+  }
+
+  function drawRoad() {
+    bg.clear();
+    hazardStripes(bg, 0, 0, ROAD_LEFT, H, 0xd9c98f, 0xf2e6b3);
+    hazardStripes(bg, ROAD_LEFT + LANES * LANE_W, 0, SIDEWALK_W, H, 0xd9c98f, 0xf2e6b3);
+    bg.lineStyle(3, 0xb8a968, 1);
+    bg.moveTo(ROAD_LEFT, 0); bg.lineTo(ROAD_LEFT, H);
+    bg.moveTo(ROAD_LEFT + LANES * LANE_W, 0); bg.lineTo(ROAD_LEFT + LANES * LANE_W, H);
+
+    for (let i = 0; i < LANES; i++) {
+      const x = ROAD_LEFT + i * LANE_W;
+      bg.beginFill(i % 2 === 0 ? 0x6f7a80 : 0x677177);
+      bg.drawRect(x, 0, LANE_W, H);
+      bg.endFill();
+    }
+    bg.lineStyle(4, 0xffffff, 0.55);
+    for (let i = 1; i < LANES; i++) {
+      const x = ROAD_LEFT + i * LANE_W;
+      for (let y = -20; y < H + 20; y += 36) {
+        bg.moveTo(x, y); bg.lineTo(x, y + 18);
+      }
+    }
+  }
+
+  // ---- lane tiles / multiplier badges ----
+  // Positioned relative to CHICKEN_Y (defined further below, already set by
+  // the time these are actually built/called) so the badge for each lane
+  // floats right above the chicken as it stands there, instead of living in
+  // a separate row far from the chicken's actual path.
+  const tiles = [];
+  function buildTiles(multipliers) {
+    tiles.forEach((t) => { camera.removeChild(t.card); camera.removeChild(t.pill); camera.removeChild(t.beam); });
+    tiles.length = 0;
+    for (let i = 0; i < LANES; i++) {
+      const cx = ROAD_LEFT + i * LANE_W + LANE_W / 2;
+      const cy = CHICKEN_Y;        // card now centered right where the chicken stands, not floating above it
+      const pillY = cy - 55;       // multiplier badge floats above the tile instead
+      const beamTop = pillY + 15;
+      const beamBottom = cy + 26;  // beam now overlaps the card itself, so the "cleared" glow lights up the same spot the chicken is standing on
+
+      // Green "cleared" trail - hidden until the lane is safely crossed,
+      // then lights up the strip of road from the pill down to the
+      // chicken's path, right where the player is actually looking.
+      const beam = new PIXI.Graphics();
+      beam.beginFill(0x2bff5c, 0.25);
+      beam.drawRoundedRect(-LANE_W / 2 + 10, 0, LANE_W - 20, beamBottom - beamTop, 8);
+      beam.endFill();
+      beam.position.set(cx, beamTop);
+      beam.visible = false;
+      camera.addChildAt(beam, 1); // just above bg, so it renders behind the chicken/vehicles
+
+      const card = new PIXI.Graphics();
+      card.beginFill(0x0b0e14, 0.28);
+      card.lineStyle(1, 0xffffff, 0.18);
+      card.drawRoundedRect(-26, -26, 52, 52, 14);
+      card.endFill();
+      card.position.set(cx, cy);
+      camera.addChild(card);
+
+      const pill = new PIXI.Graphics();
+      pill.beginFill(0x0b0e14, 0.85);
+      pill.lineStyle(1.4, 0x00e701, 0.6);
+      pill.drawRoundedRect(-32, -13, 64, 26, 13);
+      pill.endFill();
+      pill.position.set(cx, pillY);
+      camera.addChild(pill);
+
+      const label = new PIXI.Text((multipliers[i] || 1).toFixed(2) + "x", {
+        fontFamily: "monospace", fontWeight: "700", fontSize: 13, fill: 0x2bff5c,
+      });
+      label.anchor.set(0.5);
+      pill.addChild(label);
+
+      tiles.push({ card, pill, beam, cleared: false });
+    }
+    // Tiles were just (re)added to the camera, which would otherwise bury
+    // the chicken behind them now that the tile overlaps the chicken's
+    // position. Re-adding these moves them back to the top of the render
+    // order - buildVehicles() runs right after this and adds vehicles on
+    // top of everything, which is what we want for the collision look.
+    camera.addChild(chickenShadow);
+    camera.addChild(chicken);
+    camera.addChild(splat);
+  }
+
+  function markTileCleared(i) {
+    if (!tiles[i]) return;
+    tiles[i].cleared = true;
+    tiles[i].card.tint = 0x2bff5c;
+    tiles[i].card.alpha = 0.9;
+    tiles[i].beam.visible = true;
+  }
+  function markTileHit(i) {
+    if (!tiles[i]) return;
+    tiles[i].card.tint = 0xff4d5e;
+    tiles[i].card.alpha = 0.9;
+  }
+
+  // ---- vector chicken ----
+  function drawChicken() {
+    const c = new PIXI.Container();
+    const body = new PIXI.Graphics();
+    body.beginFill(0xffffff); body.drawEllipse(0, 4, 17, 15); body.endFill();
+    body.beginFill(0xf0f0f0); body.drawEllipse(4, 8, 11, 9); body.endFill();
+    c.addChild(body);
+    const wing = new PIXI.Graphics();
+    wing.beginFill(0xe8e8ea);
+    wing.drawEllipse(-8, 8, 7, 11); wing.drawEllipse(8, 8, 7, 11);
+    wing.endFill(); c.addChild(wing);
+    const tail = new PIXI.Graphics();
+    tail.beginFill(0xffffff);
+    tail.moveTo(0, -8); tail.lineTo(-6, -20); tail.lineTo(0, -15); tail.lineTo(6, -20);
+    tail.closePath(); tail.endFill(); c.addChild(tail);
+    const head = new PIXI.Graphics();
+    head.beginFill(0xffffff); head.drawCircle(0, -12, 9); head.endFill(); c.addChild(head);
+    const comb = new PIXI.Graphics();
+    comb.beginFill(0xff4d5e);
+    comb.drawCircle(-3, -20, 3); comb.drawCircle(1, -22, 3.4); comb.drawCircle(5, -20, 3);
+    comb.endFill(); c.addChild(comb);
+    const beak = new PIXI.Graphics();
+    beak.beginFill(0xffb020);
+    beak.moveTo(8, -12); beak.lineTo(15, -10); beak.lineTo(8, -8);
+    beak.closePath(); beak.endFill(); c.addChild(beak);
+    const eye = new PIXI.Graphics();
+    eye.beginFill(0x1a1a1a); eye.drawCircle(4, -14, 1.4); eye.endFill(); c.addChild(eye);
+    const feet = new PIXI.Graphics();
+    feet.lineStyle(2, 0xffb020);
+    feet.moveTo(-5, 18); feet.lineTo(-5, 24); feet.moveTo(5, 18); feet.lineTo(5, 24);
+    c.addChild(feet);
+    return c;
+  }
+
+  function drawVehicle(bodyColor, roofColor, kind) {
+    const c = new PIXI.Container();
+    const len = kind === "truck" ? 34 : kind === "bus" ? 30 : 24;
+    const w = kind === "truck" ? 20 : 18;
+    const shadow = new PIXI.Graphics();
+    shadow.beginFill(0x000000, 0.25); shadow.drawEllipse(0, len * 0.15, w * 0.6, len * 0.75); shadow.endFill();
+    c.addChild(shadow);
+    const body = new PIXI.Graphics();
+    body.beginFill(bodyColor); body.drawRoundedRect(-w / 2, -len / 2, w, len, 6); body.endFill();
+    c.addChild(body);
+    const roof = new PIXI.Graphics();
+    roof.beginFill(roofColor); roof.drawRoundedRect(-w / 2 + 3, -len / 2 + 4, w - 6, len * 0.55, 4); roof.endFill();
+    c.addChild(roof);
+    const glass = new PIXI.Graphics();
+    glass.beginFill(0x9fd8ff, 0.85); glass.drawRoundedRect(-w / 2 + 4, -len / 2 + 3, w - 8, 6, 2); glass.endFill();
+    c.addChild(glass);
+    const wheels = new PIXI.Graphics();
+    wheels.beginFill(0x1a1a1a);
+    wheels.drawRoundedRect(-w / 2 - 2, -len / 2 + 4, 3, 7, 1.5);
+    wheels.drawRoundedRect(w / 2 - 1, -len / 2 + 4, 3, 7, 1.5);
+    wheels.drawRoundedRect(-w / 2 - 2, len / 2 - 11, 3, 7, 1.5);
+    wheels.drawRoundedRect(w / 2 - 1, len / 2 - 11, 3, 7, 1.5);
+    wheels.endFill(); c.addChild(wheels);
+    return c;
+  }
+
+  const chickenShadow = new PIXI.Graphics();
+  chickenShadow.beginFill(0x000000, 0.3); chickenShadow.drawEllipse(0, 0, 18, 6); chickenShadow.endFill();
+  camera.addChild(chickenShadow);
+  const chicken = drawChicken();
+  camera.addChild(chicken);
+  const splat = new PIXI.Graphics(); // squash mark, shown only after a hit
+  splat.beginFill(0x8a1f2a, 0.6); splat.drawEllipse(0, 0, 20, 9); splat.endFill();
+  splat.visible = false;
+  camera.addChild(splat);
+
+  const VEHICLE_SPECS = [
+    { color: 0xff9a2e, roof: 0xffc46b, kind: "taxi" },
+    { color: 0x7c4dff, roof: 0xb39cff, kind: "bus" },
+    { color: 0x2ea6ff, roof: 0x9fd8ff, kind: "car" },
+    { color: 0xff4d5e, roof: 0xff9aa6, kind: "truck" },
+  ];
+  let vehicles = [];
+  function buildVehicles() {
+    vehicles.forEach((v) => camera.removeChild(v));
+    vehicles = [];
+    for (let i = 0; i < LANES; i++) {
+      const spec = VEHICLE_SPECS[i % VEHICLE_SPECS.length];
+      const s = drawVehicle(spec.color, spec.roof, spec.kind);
+      const growth = 1 + (i / (LANES - 1)) * 0.55; // further lanes = bigger vehicles
+      s.scale.set(growth);
+      s.x = ROAD_LEFT + i * LANE_W + LANE_W / 2;
+      s.y = -60 - Math.random() * 300;
+      s.speed = (1.6 + Math.random() * 1.1) * growth;
+      camera.addChild(s);
+      vehicles.push(s);
+    }
+  }
+
+  const particles = [];
+  function burst(x, y, color, n = 12) {
+    for (let i = 0; i < n; i++) {
+      const p = new PIXI.Graphics();
+      p.beginFill(color, 0.9); p.drawCircle(0, 0, 2.5 + Math.random() * 2.5); p.endFill();
+      p.x = x; p.y = y;
+      const ang = Math.random() * Math.PI * 2, spd = 1 + Math.random() * 2.8;
+      p.vx = Math.cos(ang) * spd; p.vy = Math.sin(ang) * spd - 1.4; p.life = 1;
+      camera.addChild(p); particles.push(p);
+    }
+  }
+
+  const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+
+  function laneCenterX(i) {
+    if (i <= 0) return ROAD_LEFT - SIDEWALK_W / 2;
+    if (i > LANES) return ROAD_LEFT + LANES * LANE_W + SIDEWALK_W / 2;
+    return ROAD_LEFT + (i - 1) * LANE_W + LANE_W / 2;
+  }
+  const CHICKEN_Y = H * 0.72;
+  let shake = 0;
+
+  function updateCamera() {
+    const targetX = W * 0.32 - chicken.x;
+    camera.x += (targetX - camera.x) * 0.15;
+  }
+
+  function renderBoardAtLane(laneIndex) {
+    chicken.x = laneCenterX(laneIndex);
+    chicken.y = CHICKEN_Y;
+    chicken.scale.set(1, 1);
+    chicken.rotation = 0;
+    chickenShadow.position.set(chicken.x, chicken.y + 22);
+    splat.visible = false;
+    camera.x = W * 0.32 - chicken.x;
+  }
+
+  let hopping = false;
+  function animateHop(fromLane, toLane, opts) {
+    opts = opts || {};
+    const hit = !!opts.hit, hitLane = opts.hitLane;
+    return new Promise((resolve) => {
+      hopping = true;
+      const fromX = laneCenterX(fromLane);
+      const targetLane = hit ? (hitLane + 1) : toLane; // land ON the hit lane when hit
+      const toX = laneCenterX(targetLane);
+      const start = performance.now();
+      const HOP_MS = 420;
+
+      // For a hit, drive the actual vehicle in that lane into the chicken
+      // instead of just squashing the chicken with no car ever touching it.
+      let hitStartY = 0;
+      if (hit && vehicles[hitLane]) {
+        collidingVehicle = vehicles[hitLane];
+        collidingVehicle.visible = true;
+        // Approach from a bit above so the "drive-in" is visible, but never
+        // yank it backwards if it was already further along than that.
+        hitStartY = Math.min(collidingVehicle.y, CHICKEN_Y - 170);
+        collidingVehicle.y = hitStartY;
+      }
+
+      function step() {
+        const t = Math.min((performance.now() - start) / HOP_MS, 1);
+        const ease = easeOutCubic(t);
+        chicken.x = fromX + (toX - fromX) * ease;
+        chickenShadow.x = chicken.x;
+        const arc = Math.sin(Math.PI * t) * 46;
+        chicken.y = CHICKEN_Y - arc;
+        const squash = t > 0.9 ? 1 - (t - 0.9) * 2.6 : 1;
+        chicken.scale.set(1 + (1 - squash) * 0.3, squash);
+        chickenShadow.scale.set(1 - arc / 90, 1 - arc / 140);
+        chickenShadow.y = CHICKEN_Y + 22;
+
+        if (collidingVehicle) {
+          // Times the vehicle's approach to arrive exactly as the chicken
+          // lands, so the impact reads as the car actually running it over.
+          collidingVehicle.y = hitStartY + (CHICKEN_Y - hitStartY) * ease;
+          collidingVehicle.x = toX;
+        }
+
+        if (t >= 1) {
+          if (hit) {
+            chicken.scale.set(1.5, 0.18);
+            chicken.rotation = 0;
+            if (collidingVehicle) collidingVehicle.y = CHICKEN_Y + 4;
+            splat.position.set(chicken.x, CHICKEN_Y + 14);
+            splat.visible = true;
+            shake = 6;
+            burst(chicken.x, CHICKEN_Y, 0xff4d5e, 16);
+            markTileHit(hitLane);
+            hopping = false;
+            setTimeout(() => { collidingVehicle = null; resolve(); }, 500);
+          } else {
+            burst(chicken.x, CHICKEN_Y + 16, 0xbfead0);
+            markTileCleared(toLane - 1);
+            hopping = false;
+            resolve();
+          }
+        } else {
+          requestAnimationFrame(step);
+        }
+      }
+      step();
+    });
+  }
+
+  // Two separate tracked lanes (vehicle indices):
+  //  - currentSafeLane: the lane the chicken is physically standing on right
+  //    now - always hidden, it's confirmed safe.
+  //  - previewHiddenLane: the NEXT lane, hidden only as a courtesy while the
+  //    player is deciding whether to step into it. The instant we get a real
+  //    answer back from the server (safe or hit), this is set back to null
+  //    so the true vehicle position shows for the animation - otherwise a
+  //    crash would hide the very car that hit the chicken.
+  let currentSafeLane = null;
+  let previewHiddenLane = null;
+  let collidingVehicle = null; // the vehicle sprite driven manually during a hit, so the main ticker doesn't fight it
+
+  app.ticker.add(() => {
+    vehicles.forEach((v, idx) => {
+      const inSafeZone = idx === currentSafeLane || idx === previewHiddenLane;
+      v.visible = !inSafeZone || v === collidingVehicle;
+      if (v === collidingVehicle) { v._stashed = false; return; } // fully driven by animateHop's collision sequence
+      if (inSafeZone) {
+        if (!v._stashed) {
+          // The instant this lane becomes hidden, snap the car off-screen
+          // (above view) instead of just freezing it wherever it happened
+          // to be - otherwise, however long the player waits, revealing it
+          // later could show it sitting right next to the chicken.
+          v.y = -80 - Math.random() * 260;
+          v._stashed = true;
+        }
+        return; // stays off-screen and frozen for as long as it's hidden
+      }
+      v._stashed = false;
+      v.y += v.speed;
+      v.rotation = Math.sin(v.y / 46) * 0.02;
+      if (v.y > H + 80) v.y = -80 - Math.random() * 260;
+    });
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx; p.y += p.vy; p.vy += 0.16; p.life -= 0.038;
+      p.alpha = Math.max(p.life, 0);
+      if (p.life <= 0) { camera.removeChild(p); particles.splice(i, 1); }
+    }
+    if (shake > 0) {
+      app.stage.x = (Math.random() - 0.5) * shake;
+      app.stage.y = (Math.random() - 0.5) * shake;
+      shake *= 0.82;
+      if (shake < 0.3) { shake = 0; app.stage.x = 0; app.stage.y = 0; }
+    }
+    if (!hopping) updateCamera();
+    drawRoad();
+  });
+
+  // =========================================================================
+  // GAME STATE / API WIRING
+  // =========================================================================
+  // These match CHICKEN_DIFFICULTY[...]["payout_prob"] in main.py - the
+  // probability the multiplier FORMULA assumes. For Easy and Daredevil this
+  // is deliberately different from the real per-lane survival odds, so this
+  // preview has to track payout_prob specifically, not the real odds.
+  const DIFFICULTY_PAYOUT_PROB = { easy: 0.80, medium: 0.63, hard: 0.52, daredevil: 0.33 };
+  function previewMultipliers(diff) {
+    const p = DIFFICULTY_PAYOUT_PROB[diff];
+    const out = [];
+    for (let n = 1; n <= LANES; n++) {
+      const totalProb = Math.pow(p, n);
+      out.push(totalProb > 0 ? Math.floor((0.99 / totalProb) * 100) / 100 : 0);
+    }
+    return out;
+  }
+
+  function refreshTilesForDifficulty() {
+    buildTiles(previewMultipliers(el.difficultySelect.value));
+  }
+
+  let state = "idle"; // idle | active | done
+  let currentDifficulty = "easy";
+
+  function showActionbar(buttons) {
+    el.actionbar.innerHTML = "";
+    buttons.forEach((b) => el.actionbar.appendChild(b));
+  }
+
+  function makeBtn(id, cls, text, onClick) {
+    const b = document.createElement("button");
+    b.id = id; b.className = "main-btn " + cls; b.textContent = text;
+    b.onclick = onClick;
+    return b;
+  }
+
+  function hideResult() { el.resultBanner.style.display = "none"; }
+  function showResult(win, title, sub) {
+    el.resultBanner.className = win ? "win" : "lose";
+    el.resultTitle.textContent = title;
+    el.resultSub.textContent = sub;
+    el.resultBanner.style.display = "block";
+  }
+
+  function goIdle(prefillAmount, prefillDiff) {
+    state = "idle";
+    el.idlePanel.style.display = "flex";
+    el.cashoutReadout.style.display = "none";
+    hideResult();
+    currentSafeLane = null;
+    previewHiddenLane = null;
+    if (prefillAmount != null) el.betAmount.value = Number(prefillAmount).toFixed(2);
+    if (prefillDiff) el.difficultySelect.value = prefillDiff;
+    refreshTilesForDifficulty();
+    buildVehicles();
+    renderBoardAtLane(0);
+    showActionbar([makeBtn("btn-go", "btn-go", "Go", doGo)]);
+  }
+
+  function goActive(laneIndex, multiplier) {
+    state = "active";
+    el.idlePanel.style.display = "none";
+    hideResult();
+    const amount = parseFloat(el.betAmount.value) || 0;
+    if (laneIndex > 0) {
+      el.cashoutReadout.style.display = "block";
+      el.cashoutReadout.innerHTML = "Cash out now: <b>$" + (amount * multiplier).toFixed(2) + "</b>";
+    } else {
+      el.cashoutReadout.style.display = "none";
+    }
+    currentSafeLane = laneIndex - 1;   // the lane the chicken is standing on - confirmed safe
+    previewHiddenLane = laneIndex;     // the next lane - hidden only until its outcome is known
+    const buttons = [makeBtn("btn-next", "btn-next", "Next Lane →", doNext)];
+    if (laneIndex > 0) {
+      // Cash Out only becomes available after at least one successful step -
+      // same rule the server enforces, so this is just keeping the UI honest.
+      buttons.push(makeBtn("btn-cashout", "btn-cashout", "Cash Out", doCashout));
+    }
+    showActionbar(buttons);
+  }
+
+  function goDone() {
+    state = "done";
+    el.cashoutReadout.style.display = "none";
+    currentSafeLane = null;
+    previewHiddenLane = null;
+    showActionbar([makeBtn("btn-again", "btn-again", "Play Again", doPlayAgain)]);
+  }
+
+  let localLaneIndex = 0;
+
+  async function doGo() {
+    el.btnGo && (el.btnGo.disabled = true);
+    try {
+      const amount = parseFloat(el.betAmount.value) || undefined;
+      const difficulty = el.difficultySelect.value;
+      currentDifficulty = difficulty;
+      const data = await apiPost("/api/chickenroad/start", { init_data: initData, token, amount, difficulty });
+      setBalance(data.balance);
+      localLaneIndex = 0;
+      LANES = data.lanes || LANES;
+      refreshTilesForDifficulty();
+      buildVehicles();
+      renderBoardAtLane(0);
+      goActive(0, 1.0);
+    } catch (e) {
+      showToast(e.message);
+      const btn = document.getElementById("btn-go");
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function doNext() {
+    Array.from(el.actionbar.querySelectorAll("button")).forEach((b) => (b.disabled = true));
+    try {
+      const data = await apiPost("/api/chickenroad/step", { init_data: initData, token });
+      if (data.status === "crashed") {
+        previewHiddenLane = null; // reveal the real car for the collision - it was the "next lane" courtesy-hide
+        await animateHop(localLaneIndex, localLaneIndex, { hit: true, hitLane: data.hit_lane });
+        currentSafeLane = null;
+        goDone();
+        showResult(false, "Hit by a car!", "Lost on lane " + (data.hit_lane + 1));
+      } else if (data.status === "cashed_out") {
+        previewHiddenLane = null;
+        localLaneIndex = data.lane_index;
+        await animateHop(localLaneIndex - 1, localLaneIndex, { hit: false });
+        currentSafeLane = null;
+        burst(chicken.x, chicken.y - 10, 0xffd166, 20);
+        goDone();
+        showResult(true, "Full clear!", "Won $" + (data.payout - data.amount).toFixed(2) + " at " + data.multiplier.toFixed(2) + "x");
+      } else if (data.status === "active") {
+        const newLane = data.lane_index;
+        previewHiddenLane = null; // reveal briefly during the hop; goActive() below re-hides the new next lane
+        await animateHop(localLaneIndex, newLane, { hit: false });
+        localLaneIndex = newLane;
+        goActive(localLaneIndex, data.multiplier);
+      }
+      setBalance(data.balance);
+    } catch (e) {
+      showToast(e.message);
+      Array.from(el.actionbar.querySelectorAll("button")).forEach((b) => (b.disabled = false));
+    }
+  }
+
+  async function doCashout() {
+    Array.from(el.actionbar.querySelectorAll("button")).forEach((b) => (b.disabled = true));
+    try {
+      const data = await apiPost("/api/chickenroad/cashout", { init_data: initData, token });
+      if (data.result === "crashed") {
+        // The round had already crashed (e.g. a step and a cashout raced) -
+        // nothing was paid out server-side, so don't claim a win here either.
+        previewHiddenLane = null;
+        await animateHop(localLaneIndex, localLaneIndex, { hit: true, hitLane: data.hit_lane });
+        currentSafeLane = null;
+        goDone();
+        showResult(false, "Hit by a car!", "Lost on lane " + (data.hit_lane + 1));
+        return;
+      }
+      setBalance(data.balance);
+      currentSafeLane = null;
+      previewHiddenLane = null;
+      burst(chicken.x, chicken.y - 10, 0xffd166, 20);
+      goDone();
+      showResult(true, "Cashed out!", "Won $" + (data.payout - data.amount).toFixed(2) + " at " + data.multiplier.toFixed(2) + "x");
+    } catch (e) {
+      showToast(e.message);
+      Array.from(el.actionbar.querySelectorAll("button")).forEach((b) => (b.disabled = false));
+    }
+  }
+
+  async function doPlayAgain() {
+    try {
+      await apiPost("/api/chickenroad/again", { init_data: initData, token });
+      goIdle(parseFloat(el.betAmount.value), currentDifficulty);
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  el.difficultySelect.addEventListener("change", () => {
+    if (state === "idle") refreshTilesForDifficulty();
+  });
+
+  async function bootstrap() {
+    try {
+      const data = await apiGet("/api/chickenroad/info?token=" + encodeURIComponent(token));
+      setBalance(data.balance);
+      LANES = data.lanes || LANES;
+      currentDifficulty = data.difficulty || "easy";
+      el.difficultySelect.value = currentDifficulty;
+
+      if (data.status === "pending") {
+        goIdle(data.amount, currentDifficulty);
+      } else if (data.status === "active") {
+        localLaneIndex = data.lane_index;
+        refreshTilesForDifficulty();
+        buildVehicles();
+        renderBoardAtLane(localLaneIndex);
+        for (let i = 0; i < localLaneIndex; i++) markTileCleared(i);
+        goActive(localLaneIndex, data.multiplier);
+      } else if (data.status === "crashed") {
+        refreshTilesForDifficulty();
+        buildVehicles();
+        renderBoardAtLane(data.hit_lane);
+        for (let i = 0; i < data.hit_lane; i++) markTileCleared(i);
+        markTileHit(data.hit_lane);
+        if (vehicles[data.hit_lane]) {
+          vehicles[data.hit_lane].visible = true;
+          vehicles[data.hit_lane].x = chicken.x;
+          vehicles[data.hit_lane].y = chicken.y + 4;
+        }
+        chicken.scale.set(1.5, 0.18);
+        splat.position.set(chicken.x, CHICKEN_Y + 14);
+        splat.visible = true;
+        goDone();
+        showResult(false, "Hit by a car!", "Lost on lane " + (data.hit_lane + 1));
+      } else if (data.status === "cashed_out") {
+        localLaneIndex = data.lane_index;
+        refreshTilesForDifficulty();
+        buildVehicles();
+        renderBoardAtLane(localLaneIndex);
+        for (let i = 0; i < localLaneIndex; i++) markTileCleared(i);
+        goDone();
+        showResult(true, "Cashed out!", "Won at " + data.multiplier.toFixed(2) + "x");
+      }
+    } catch (e) {
+      showToast("Couldn't load this road - it may have expired");
+    }
+  }
+
+  bootstrap();
+})();
+</script>
+</body>
+</html>

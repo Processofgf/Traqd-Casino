@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Dice</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700;800&family=Inter:wght@400;500;600;700;800&display=swap');
+
+  :root {
+    --void: #0b0e14;
+    --panel: #151a27;
+    --panel2: #1b2133;
+    --line: rgba(255,255,255,0.07);
+    --green: #00e701;
+    --red: #ff4d5e;
+    --gold: #ffc93c;
+    --mist: #7c8aa0;
+    --text: #eef1f8;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--void);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  #app { position: relative; height: 100dvh; width: 100vw; display: flex; flex-direction: column; }
+
+  #topbar {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 16px 0;
+  }
+  #topbar .brand { display: flex; align-items: center; gap: 7px; font-weight: 800; color: var(--text); font-size: 13px; }
+  #topbar .brand .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--gold); box-shadow: 0 0 8px var(--gold); }
+  #balance-pill {
+    background: var(--panel); border: 1px solid var(--line); padding: 7px 13px; border-radius: 100px;
+    font-family: 'JetBrains Mono', monospace; font-weight: 600; font-size: 13px; color: var(--gold);
+  }
+
+  #main { flex: 1; display: flex; flex-direction: column; padding: 14px 16px 0; overflow-y: auto; }
+
+  #roll-stage {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    padding: 22px 18px 26px;
+    text-align: center;
+    position: relative;
+  }
+  #roll-number {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 800;
+    font-size: 54px;
+    letter-spacing: -0.02em;
+    line-height: 1;
+    transition: color 0.15s ease;
+  }
+  #roll-number.win { color: var(--green); text-shadow: 0 0 22px rgba(0,231,1,0.35); }
+  #roll-number.lose { color: var(--red); text-shadow: 0 0 22px rgba(255,77,94,0.3); }
+  #roll-caption { margin-top: 6px; font-size: 12px; color: var(--mist); }
+
+  #result-line { margin-top: 12px; font-size: 14px; font-weight: 700; min-height: 20px; }
+  #result-line.win { color: var(--green); }
+  #result-line.lose { color: var(--red); }
+
+  #slider-wrap { margin-top: 18px; padding: 0 4px; position: relative; }
+  #slider-track {
+    height: 10px; border-radius: 6px; position: relative; overflow: visible;
+    background: var(--panel2);
+  }
+  #slider-fill-lose, #slider-fill-win {
+    position: absolute; top: 0; height: 100%;
+  }
+  #slider-fill-lose { background: rgba(255,77,94,0.55); border-radius: 6px; }
+  #slider-fill-win { background: rgba(0,231,1,0.55); border-radius: 6px; }
+  #target-range {
+    -webkit-appearance: none; appearance: none;
+    position: absolute; top: -11px; left: 0; width: 100%; height: 32px;
+    background: transparent; margin: 0; cursor: pointer;
+  }
+  #target-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 26px; height: 26px; border-radius: 50%;
+    background: var(--text);
+    border: 3px solid var(--gold);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    cursor: pointer;
+  }
+  #target-range::-moz-range-thumb {
+    width: 26px; height: 26px; border-radius: 50%;
+    background: var(--text);
+    border: 3px solid var(--gold);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    cursor: pointer;
+  }
+  #marker {
+    position: absolute; top: -18px; width: 3px; height: 46px;
+    background: var(--gold); border-radius: 2px;
+    transform: translateX(-50%);
+    display: none; pointer-events: none;
+  }
+  #dice-icon {
+    position: absolute; top: -52px; width: 34px; height: 34px;
+    transform: translateX(-50%);
+    display: none; pointer-events: none;
+    font-size: 28px; line-height: 34px; text-align: center;
+    filter: drop-shadow(0 3px 6px rgba(0,0,0,0.45));
+  }
+  #dice-icon.rolling { animation: diceSpin 0.35s linear infinite; }
+  #dice-icon.win { filter: drop-shadow(0 0 10px rgba(0,231,1,0.6)); }
+  #dice-icon.lose { filter: drop-shadow(0 0 10px rgba(255,77,94,0.55)); }
+  @keyframes diceSpin {
+    0%   { transform: translateX(-50%) rotate(0deg) scale(1); }
+    50%  { transform: translateX(-50%) rotate(180deg) scale(1.12); }
+    100% { transform: translateX(-50%) rotate(360deg) scale(1); }
+  }
+  #slider-scale {
+    display: flex; justify-content: space-between; margin-top: 8px;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--mist);
+  }
+
+  #direction-toggle {
+    display: flex; gap: 8px; margin-top: 18px;
+  }
+  .dir-btn {
+    flex: 1; padding: 12px; border-radius: 12px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--mist); font-weight: 700; font-size: 13px;
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  .dir-btn.active { border-color: var(--gold); color: var(--gold); background: rgba(255,201,60,0.08); }
+
+  #stats-row {
+    display: flex; gap: 8px; margin-top: 14px;
+  }
+  .stat-box {
+    flex: 1; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 10px 8px; text-align: center;
+  }
+  .stat-box .label { font-size: 10px; color: var(--mist); text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat-box .value { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 15px; margin-top: 3px; color: var(--text); }
+  .stat-box.mult .value { color: var(--gold); }
+
+  #bet-row { display: flex; gap: 8px; margin-top: 14px; align-items: center; }
+  #bet-amount {
+    flex: 1; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 14px; color: var(--text); font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 15px;
+  }
+  .quick-btn {
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 10px; color: var(--mist); font-weight: 700; font-size: 12px;
+  }
+
+  #actionbar { padding: 14px 16px calc(env(safe-area-inset-bottom, 0px) + 14px); }
+  #btn-primary {
+    width: 100%; padding: 16px; border-radius: 14px; border: none;
+    background: var(--gold); color: #1a1300; font-weight: 800; font-size: 15px;
+    box-shadow: 0 4px 18px rgba(255,201,60,0.25);
+  }
+  #btn-primary:disabled { opacity: 0.5; }
+  #btn-again {
+    width: 100%; padding: 16px; border-radius: 14px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--text); font-weight: 800; font-size: 15px; display: none;
+  }
+
+  #error-toast {
+    position: absolute; bottom: 90px; left: 50%; transform: translateX(-50%);
+    background: rgba(255,77,94,0.95); color: #fff; padding: 10px 18px; border-radius: 100px;
+    font-size: 13px; font-weight: 600; display: none; z-index: 20; white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <div class="brand"><span class="dot"></span>🎲 DICE</div>
+    <div id="balance-pill">$0.00</div>
+  </div>
+
+  <div id="main">
+    <div id="roll-stage">
+      <div id="roll-number">--.--</div>
+      <div id="roll-caption">Adjust your target, then roll</div>
+      <div id="result-line"></div>
+    </div>
+
+    <div id="slider-wrap">
+      <div id="slider-track">
+        <div id="slider-fill-lose"></div>
+        <div id="slider-fill-win"></div>
+        <div id="marker"></div>
+        <div id="dice-icon">🎲</div>
+        <input type="range" id="target-range" min="2" max="98" step="0.01" value="50" />
+      </div>
+      <div id="slider-scale"><span>0</span><span>25</span><span>50</span><span>75</span><span>100</span></div>
+    </div>
+
+    <div id="direction-toggle">
+      <button class="dir-btn active" id="btn-under">Roll Under</button>
+      <button class="dir-btn" id="btn-over">Roll Over</button>
+    </div>
+
+    <div id="stats-row">
+      <div class="stat-box mult"><div class="label">Multiplier</div><div class="value" id="stat-mult">1.98x</div></div>
+      <div class="stat-box"><div class="label">Win Chance</div><div class="value" id="stat-chance">50.00%</div></div>
+      <div class="stat-box"><div class="label">Target</div><div class="value" id="stat-target">50.00</div></div>
+    </div>
+
+    <div id="bet-row">
+      <input type="text" id="bet-amount" inputmode="decimal" value="1.00" />
+      <button class="quick-btn" data-op="half">½</button>
+      <button class="quick-btn" data-op="double">2×</button>
+    </div>
+  </div>
+
+  <div id="actionbar">
+    <button id="btn-primary">Roll</button>
+    <button id="btn-again">Play Again</button>
+  </div>
+
+  <div id="error-toast"></div>
+</div>
+
+<script>
+(function () {
+  const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  if (tg) { tg.ready(); tg.expand(); }
+
+  const token = location.pathname.split("/").filter(Boolean).pop();
+  const params = new URLSearchParams(location.search);
+  const API_BASE = params.get("api") ? decodeURIComponent(params.get("api")) : "";
+
+  const el = {
+    balance: document.getElementById("balance-pill"),
+    rollNumber: document.getElementById("roll-number"),
+    rollCaption: document.getElementById("roll-caption"),
+    resultLine: document.getElementById("result-line"),
+    range: document.getElementById("target-range"),
+    fillLose: document.getElementById("slider-fill-lose"),
+    fillWin: document.getElementById("slider-fill-win"),
+    marker: document.getElementById("marker"),
+    diceIcon: document.getElementById("dice-icon"),
+    btnUnder: document.getElementById("btn-under"),
+    btnOver: document.getElementById("btn-over"),
+    statMult: document.getElementById("stat-mult"),
+    statChance: document.getElementById("stat-chance"),
+    statTarget: document.getElementById("stat-target"),
+    betAmount: document.getElementById("bet-amount"),
+    btnPrimary: document.getElementById("btn-primary"),
+    btnAgain: document.getElementById("btn-again"),
+    toast: document.getElementById("error-toast"),
+  };
+
+  let houseEdge = 0.01;
+  let minTarget = 2.00;
+  let maxTarget = 98.00;
+  let direction = "under";
+  let target = 50.00;
+  let state = "pending"; // pending | rolling | done
+  let rolling = false;
+
+  function showToast(msg) {
+    el.toast.textContent = msg;
+    el.toast.style.display = "block";
+    setTimeout(() => (el.toast.style.display = "none"), 2600);
+  }
+  function setBalance(v) { el.balance.textContent = "$" + Number(v).toFixed(2); }
+
+  async function apiPost(path, body) {
+    const res = await fetch(API_BASE + path, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Something went wrong");
+    return data;
+  }
+  async function apiGet(path) {
+    const res = await fetch(API_BASE + path, { cache: "no-store" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Something went wrong");
+    return data;
+  }
+
+  document.querySelectorAll(".quick-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      let v = parseFloat(el.betAmount.value) || 0;
+      const op = btn.dataset.op;
+      if (op === "half") v = Math.max(0.10, v / 2);
+      else if (op === "double") v = v * 2;
+      el.betAmount.value = v.toFixed(2);
+    });
+  });
+
+  function winChance() {
+    return direction === "under" ? target : (100 - target);
+  }
+  function fairMultiplier(chancePct) {
+    if (chancePct <= 0) return 0;
+    return Math.floor(((1 - houseEdge) / (chancePct / 100)) * 100) / 100;
+  }
+
+  function renderSlider() {
+    const span = maxTarget - minTarget;
+    const pct = ((target - minTarget) / span) * 100;
+    if (direction === "under") {
+      el.fillWin.style.left = "0%";
+      el.fillWin.style.width = pct + "%";
+      el.fillLose.style.left = pct + "%";
+      el.fillLose.style.width = (100 - pct) + "%";
+    } else {
+      el.fillLose.style.left = "0%";
+      el.fillLose.style.width = pct + "%";
+      el.fillWin.style.left = pct + "%";
+      el.fillWin.style.width = (100 - pct) + "%";
+    }
+  }
+
+  function renderStats() {
+    const chance = winChance();
+    const mult = fairMultiplier(chance);
+    el.statMult.textContent = mult.toFixed(2) + "x";
+    el.statChance.textContent = chance.toFixed(2) + "%";
+    el.statTarget.textContent = target.toFixed(2);
+    renderSlider();
+  }
+
+  function setDirection(dir) {
+    direction = dir;
+    el.btnUnder.classList.toggle("active", dir === "under");
+    el.btnOver.classList.toggle("active", dir === "over");
+    renderStats();
+  }
+
+  el.btnUnder.addEventListener("click", () => { if (state === "pending") setDirection("under"); });
+  el.btnOver.addEventListener("click", () => { if (state === "pending") setDirection("over"); });
+  el.range.addEventListener("input", () => {
+    if (state !== "pending") return;
+    target = Math.round(parseFloat(el.range.value) * 100) / 100;
+    renderStats();
+  });
+
+  function showMarker(rollValue, outcomeClass) {
+    const span = maxTarget - minTarget;
+    const pct = Math.min(100, Math.max(0, ((rollValue - minTarget) / span) * 100));
+    el.marker.style.left = pct + "%";
+    el.marker.style.display = "block";
+    el.diceIcon.style.left = pct + "%";
+    el.diceIcon.style.display = "block";
+    el.diceIcon.classList.remove("rolling", "win", "lose");
+    if (outcomeClass) el.diceIcon.classList.add(outcomeClass);
+  }
+
+  function animateRollTo(finalValue, win) {
+    return new Promise((resolve) => {
+      el.diceIcon.style.display = "block";
+      el.diceIcon.classList.add("rolling");
+      el.diceIcon.classList.remove("win", "lose");
+      el.marker.style.display = "block";
+
+      let ticks = 0;
+      const maxTicks = 16;
+      const iv = setInterval(() => {
+        ticks++;
+        if (ticks >= maxTicks) {
+          clearInterval(iv);
+          el.rollNumber.textContent = finalValue.toFixed(2);
+          el.rollNumber.className = win ? "win" : "lose";
+          el.diceIcon.classList.remove("rolling");
+          showMarker(finalValue, win ? "win" : "lose");
+          resolve();
+          return;
+        }
+        const fake = Math.random() * (maxTarget - minTarget) + minTarget;
+        el.rollNumber.textContent = fake.toFixed(2);
+        el.rollNumber.className = "";
+        // Bounce the dice along the bar in step with the flickering number,
+        // so it visually "rolls" toward the final spot instead of just
+        // spinning in place.
+        const span = maxTarget - minTarget;
+        const pct = Math.min(100, Math.max(0, ((fake - minTarget) / span) * 100));
+        el.marker.style.left = pct + "%";
+        el.diceIcon.style.left = pct + "%";
+      }, 45);
+    });
+  }
+
+  function resetForNewRound() {
+    state = "pending";
+    el.rollNumber.textContent = "--.--";
+    el.rollNumber.className = "";
+    el.rollCaption.textContent = "Adjust your target, then roll";
+    el.resultLine.textContent = "";
+    el.resultLine.className = "";
+    el.marker.style.display = "none";
+    el.diceIcon.style.display = "none";
+    el.diceIcon.classList.remove("rolling", "win", "lose");
+    el.range.disabled = false;
+    el.btnUnder.style.pointerEvents = "auto";
+    el.btnOver.style.pointerEvents = "auto";
+    el.betAmount.disabled = false;
+    el.btnPrimary.style.display = "block";
+    el.btnPrimary.disabled = false;
+    el.btnPrimary.textContent = "Roll";
+    el.btnAgain.style.display = "none";
+    renderStats();
+  }
+
+  function showDoneState(data) {
+    state = "done";
+    direction = data.direction;
+    target = data.target;
+    setDirection(direction);
+    el.range.value = target;
+    renderStats();
+    el.range.disabled = true;
+    el.betAmount.disabled = true;
+    el.btnPrimary.style.display = "none";
+    el.btnAgain.style.display = "block";
+
+    el.rollNumber.textContent = data.roll.toFixed(2);
+    el.rollNumber.className = data.win ? "win" : "lose";
+    showMarker(data.roll, data.win ? "win" : "lose");
+    el.rollCaption.textContent = "Needed " + direction + " " + Number(target).toFixed(2);
+    if (data.win) {
+      el.resultLine.textContent = "+ $" + (data.payout - data.amount).toFixed(2) + " won";
+      el.resultLine.className = "win";
+    } else {
+      el.resultLine.textContent = "- $" + Number(data.amount).toFixed(2) + " lost";
+      el.resultLine.className = "lose";
+    }
+  }
+
+  el.btnPrimary.addEventListener("click", async () => {
+    if (rolling || state !== "pending") return;
+    const amount = parseFloat(el.betAmount.value);
+    if (!amount || amount <= 0) { showToast("Enter a valid bet amount"); return; }
+
+    rolling = true;
+    el.btnPrimary.disabled = true;
+    el.range.disabled = true;
+    el.betAmount.disabled = true;
+    el.rollCaption.textContent = "Rolling...";
+    el.resultLine.textContent = "";
+    el.resultLine.className = "";
+
+    try {
+      const data = await apiPost("/api/dice/roll", { token, amount, direction, target });
+      setBalance(data.balance);
+      await animateRollTo(data.roll, data.win);
+      showDoneState(data);
+    } catch (e) {
+      showToast(e.message);
+      state = "pending";
+      el.btnPrimary.disabled = false;
+      el.range.disabled = false;
+      el.betAmount.disabled = false;
+      el.rollCaption.textContent = "Adjust your target, then roll";
+    } finally {
+      rolling = false;
+    }
+  });
+
+  el.btnAgain.addEventListener("click", async () => {
+    try {
+      const amount = parseFloat(el.betAmount.value) || undefined;
+      const data = await apiGet("/api/dice/info?token=" + encodeURIComponent(token));
+      setBalance(data.balance);
+      await apiPost("/api/dice/again", { token, amount });
+      resetForNewRound();
+    } catch (e) {
+      showToast(e.message);
+    }
+  });
+
+  async function bootstrap() {
+    try {
+      const data = await apiGet("/api/dice/info?token=" + encodeURIComponent(token));
+      houseEdge = data.house_edge;
+      minTarget = data.min_target;
+      maxTarget = data.max_target;
+      el.range.min = minTarget;
+      el.range.max = maxTarget;
+      setBalance(data.balance);
+      el.betAmount.value = Number(data.amount).toFixed(2);
+
+      if (data.status === "pending") {
+        target = 50;
+        el.range.value = target;
+        setDirection("under");
+        resetForNewRound();
+      } else if (data.status === "done") {
+        showDoneState(data);
+      }
+    } catch (e) {
+      showToast(e.message || "Couldn't load this table");
+    }
+  }
+
+  bootstrap();
+})();
+</script>
+</body>
+</html>

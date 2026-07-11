@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Blackjack</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700;800&family=Inter:wght@400;500;600;700;800&display=swap');
+
+  :root {
+    --void: #0b0e14;
+    --felt: #0d3324;
+    --felt-2: #0a2a1c;
+    --rim: #d4af37;
+    --panel: #151a27;
+    --panel-2: #1a2032;
+    --line: rgba(255,255,255,0.07);
+    --green: #00e701;
+    --red-suit: #ff4d5e;
+    --gold: #ffc93c;
+    --mist: #7c8aa0;
+    --text: #eef1f8;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--void);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  #app {
+    position: relative;
+    height: 100dvh;
+    width: 100vw;
+    display: flex;
+    flex-direction: column;
+    background: var(--void);
+  }
+
+  #topbar {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 16px 0;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: var(--mist);
+    text-transform: uppercase;
+  }
+  #topbar .brand { display: flex; align-items: center; gap: 7px; font-weight: 800; color: var(--text); font-size: 13px; }
+  #topbar .brand .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--gold); box-shadow: 0 0 8px var(--gold); }
+  #balance-pill {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    padding: 7px 13px;
+    border-radius: 100px;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--gold);
+  }
+
+  /* ---- felt table ---- */
+  #table-wrap {
+    position: relative;
+    flex: 1;
+    margin: 10px 12px 0;
+    border-radius: 22px;
+    overflow: hidden;
+    background:
+      radial-gradient(120% 90% at 50% 20%, rgba(255,255,255,0.05), transparent 55%),
+      radial-gradient(140% 100% at 50% 100%, var(--felt) 0%, var(--felt-2) 70%);
+    border: 2px solid rgba(212,175,55,0.35);
+  }
+  #table-wrap::before {
+    content: "";
+    position: absolute; inset: 0;
+    background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.015) 0 2px, transparent 2px 14px);
+    pointer-events: none;
+  }
+
+  .zone { position: relative; display: flex; flex-direction: column; align-items: center; padding: 10px 8px; }
+  .zone-label { font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: rgba(238,241,248,0.45); font-weight: 700; margin-bottom: 6px; }
+  #dealer-zone { flex: 0 0 auto; padding-top: 16px; }
+  #hands-zone { flex: 1; display: flex; align-items: flex-end; justify-content: center; gap: 14px; padding-bottom: 14px; }
+
+  .hand-block { display: flex; flex-direction: column; align-items: center; gap: 6px; transition: transform 0.2s ease, opacity 0.2s ease; }
+  .hand-block.inactive { opacity: 0.55; }
+  .hand-block.active-hand { transform: translateY(-4px); }
+  .hand-total {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700; font-size: 13px;
+    background: rgba(0,0,0,0.35);
+    border: 1px solid var(--line);
+    padding: 3px 10px;
+    border-radius: 100px;
+  }
+  .hand-total.bust { color: var(--red-suit); border-color: rgba(255,77,94,0.5); }
+  .hand-total.win { color: var(--green); border-color: rgba(0,231,1,0.5); }
+  .hand-total.push { color: var(--mist); }
+
+  .card-row { display: flex; }
+  .card {
+    width: 46px; height: 64px;
+    margin-left: -14px;
+    border-radius: 7px;
+    background: #fbfbf6;
+    box-shadow: 0 3px 8px rgba(0,0,0,0.4);
+    display: flex; flex-direction: column; justify-content: space-between;
+    padding: 4px 5px;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 14px;
+    color: #16181f;
+    position: relative;
+  }
+  .card.deal-in { animation: dealCard 0.32s cubic-bezier(.2,.8,.3,1) both; }
+  .card.flip-in { animation: flipReveal 0.38s cubic-bezier(.2,.8,.3,1) both; }
+  .card:first-child { margin-left: 0; }
+  .card.red { color: var(--red-suit); }
+  .card .suit-big { align-self: center; font-size: 20px; }
+  .card.back {
+    background: repeating-linear-gradient(135deg, #2a2f6b 0 5px, #232758 5px 10px);
+    border: 2px solid rgba(255,255,255,0.15);
+  }
+
+  @keyframes dealCard {
+    from { opacity: 0; transform: translateY(-26px) rotate(-8deg) scale(0.85); }
+    to { opacity: 1; transform: translateY(0) rotate(0) scale(1); }
+  }
+  @keyframes flipReveal {
+    from { opacity: 0.25; transform: rotateY(90deg) scale(0.9); }
+    to { opacity: 1; transform: rotateY(0deg) scale(1); }
+  }
+
+  #result-banner {
+    position: absolute; left: 0; right: 0; top: 42%;
+    text-align: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 800;
+    font-size: 9vw;
+    letter-spacing: -0.01em;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+    text-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  }
+  #result-banner.show { opacity: 1; }
+  #result-banner.win { color: var(--gold); }
+  #result-banner.lose { color: var(--red-suit); }
+  #result-banner.push { color: var(--mist); }
+
+  /* ---- idle / bet setup panel ---- */
+  #idle-panel {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px;
+    background: rgba(11,14,20,0.8);
+    backdrop-filter: blur(8px);
+  }
+  #idle-panel .label { font-size: 11px; letter-spacing: 0.1em; color: var(--mist); text-transform: uppercase; font-weight: 700; }
+  #bet-amount {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 40px; font-weight: 700; color: var(--text);
+    background: transparent; border: none; text-align: center; width: 60%;
+    border-bottom: 2px solid var(--line);
+    padding-bottom: 6px;
+  }
+  #bet-amount:focus { outline: none; border-color: var(--gold); }
+  #quick-amounts { display: flex; gap: 8px; }
+  .quick-btn {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px; font-weight: 700;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    padding: 7px 13px;
+    border-radius: 100px;
+    cursor: pointer;
+  }
+  .quick-btn:active { transform: scale(0.95); }
+
+  /* ---- bottom action bar ---- */
+  #actionbar { padding: 12px 16px calc(16px + env(safe-area-inset-bottom)); display: flex; gap: 8px; }
+  button.main-btn, button.action-btn {
+    border: none;
+    font-family: 'Inter', sans-serif;
+    font-weight: 800;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    transition: transform 0.08s ease, opacity 0.2s ease;
+  }
+  button.main-btn { width: 100%; padding: 18px; border-radius: 16px; font-size: 16px; }
+  button.action-btn { flex: 1; padding: 15px 4px; border-radius: 14px; font-size: 13.5px; }
+  button:active { transform: scale(0.96); }
+  button:disabled { opacity: 0.35; }
+
+  .btn-deal { background: var(--gold); color: #241300; box-shadow: 0 0 24px rgba(255,201,60,0.25); }
+  .btn-hit { background: var(--green); color: #06210a; }
+  .btn-stand { background: #ff4d5e; color: #26060a; }
+  .btn-double { background: var(--indigo, #8b93ff); color: #12123a; }
+  .btn-split { background: var(--panel-2); color: var(--text); border: 1px solid var(--line) !important; }
+  .btn-again { background: var(--panel); color: var(--text); border: 1px solid var(--line); }
+
+  #error-toast {
+    position: absolute; left: 16px; right: 16px; bottom: 96px;
+    background: rgba(255,77,94,0.16);
+    border: 1px solid rgba(255,77,94,0.4);
+    color: #ffd7dd;
+    padding: 10px 14px;
+    border-radius: 12px;
+    font-size: 13px;
+    text-align: center;
+    display: none;
+    z-index: 5;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div id="topbar">
+    <div class="brand"><span class="dot"></span>BLACKJACK</div>
+    <div id="balance-pill">$--.--</div>
+  </div>
+
+  <div id="table-wrap">
+    <div class="zone" id="dealer-zone">
+      <div class="zone-label">Dealer</div>
+      <div class="card-row" id="dealer-cards"></div>
+      <div class="hand-total" id="dealer-total" style="margin-top:6px; display:none;"></div>
+    </div>
+
+    <div id="result-banner"></div>
+
+    <div class="zone" id="hands-zone"></div>
+
+    <div id="idle-panel">
+      <div class="label">Bet Amount</div>
+      <input id="bet-amount" type="number" inputmode="decimal" step="0.10" min="0.10" value="10.00" readonly />
+      <div id="quick-amounts">
+        <button class="quick-btn" data-op="half">½</button>
+        <button class="quick-btn" data-op="double">2×</button>
+        <button class="quick-btn" data-op="10">+10</button>
+        <button class="quick-btn" data-op="50">+50</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="error-toast"></div>
+
+  <div id="actionbar">
+    <button id="btn-deal" class="main-btn btn-deal">Deal</button>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  if (tg) { tg.ready(); tg.expand(); }
+  const initData = tg ? tg.initData : "";
+
+  const token = location.pathname.split("/").filter(Boolean).pop();
+  const params = new URLSearchParams(location.search);
+  const prefillAmount = parseFloat(params.get("amount") || "10");
+  const API_BASE = params.get("api") ? decodeURIComponent(params.get("api")) : "";
+
+  const SUIT_SYMBOL = { S: "♠", H: "♥", D: "♦", C: "♣" };
+  const RED_SUITS = ["H", "D"];
+
+  const el = {
+    idlePanel: document.getElementById("idle-panel"),
+    betAmount: document.getElementById("bet-amount"),
+    quickAmounts: document.getElementById("quick-amounts"),
+    balance: document.getElementById("balance-pill"),
+    dealerCards: document.getElementById("dealer-cards"),
+    dealerTotal: document.getElementById("dealer-total"),
+    handsZone: document.getElementById("hands-zone"),
+    resultBanner: document.getElementById("result-banner"),
+    actionbar: document.getElementById("actionbar"),
+    btnDeal: document.getElementById("btn-deal"),
+    toast: document.getElementById("error-toast"),
+  };
+  el.betAmount.value = prefillAmount.toFixed(2);
+
+  el.quickAmounts.addEventListener("click", (e) => {
+    const btn = e.target.closest(".quick-btn");
+    if (!btn) return;
+    let v = parseFloat(el.betAmount.value) || 0;
+    const op = btn.dataset.op;
+    if (op === "half") v = Math.max(0.10, v / 2);
+    else if (op === "double") v = v * 2;
+    else v = v + parseFloat(op);
+    el.betAmount.value = v.toFixed(2);
+  });
+
+  function showToast(msg) {
+    el.toast.textContent = msg;
+    el.toast.style.display = "block";
+    setTimeout(() => (el.toast.style.display = "none"), 2600);
+  }
+
+  function setBalance(v) {
+    el.balance.textContent = "$" + Number(v).toFixed(2);
+  }
+
+  function cardKey(c) {
+    return c.rank === null ? "back" : c.rank + c.suit;
+  }
+
+  function buildCardElement(card, animClass, delayMs) {
+    const d = document.createElement("div");
+    if (card.rank === null) {
+      d.className = "card back " + animClass;
+    } else {
+      const isRed = RED_SUITS.includes(card.suit);
+      d.className = "card" + (isRed ? " red" : "") + " " + animClass;
+      d.innerHTML =
+        `<div>${card.rank}</div><div class="suit-big">${SUIT_SYMBOL[card.suit]}</div><div style="align-self:flex-end;transform:rotate(180deg)">${card.rank}</div>`;
+    }
+    d.style.animationDelay = delayMs + "ms";
+    return d;
+  }
+
+  const CARD_STAGGER_MS = 170;
+
+  // Reconciles `container`'s children against `newCards`, given `prevKeys`
+  // (the keys - see cardKey() - that are currently rendered). Only cards
+  // that are genuinely new get the deal-in slide animation, staggered one
+  // after another so they visibly arrive one by one. A dealer hole card
+  // flipping from hidden to revealed gets a flip animation in place.
+  // Anything that doesn't fit that pattern (fewer cards than before, i.e. a
+  // fresh deal replacing a finished hand) does a full rebuild instead.
+  // Returns the new keys array to store for next time.
+  function reconcileCards(container, prevKeys, newCards) {
+    const newKeys = newCards.map(cardKey);
+
+    let compatible = newKeys.length >= prevKeys.length;
+    let revealIndex = -1;
+    if (compatible) {
+      for (let i = 0; i < prevKeys.length; i++) {
+        if (prevKeys[i] === newKeys[i]) continue;
+        if (prevKeys[i] === "back" && newKeys[i] !== "back" && revealIndex === -1) {
+          revealIndex = i;
+          continue;
+        }
+        compatible = false;
+        break;
+      }
+    }
+
+    if (!compatible) {
+      container.innerHTML = "";
+      newCards.forEach((c, i) => container.appendChild(buildCardElement(c, "deal-in", i * CARD_STAGGER_MS)));
+      return newKeys;
+    }
+
+    if (revealIndex !== -1) {
+      const oldEl = container.children[revealIndex];
+      const newEl = buildCardElement(newCards[revealIndex], "flip-in", 0);
+      if (oldEl) container.replaceChild(newEl, oldEl);
+      else container.appendChild(newEl);
+    }
+
+    for (let i = prevKeys.length; i < newCards.length; i++) {
+      const delay = (i - prevKeys.length) * CARD_STAGGER_MS;
+      container.appendChild(buildCardElement(newCards[i], "deal-in", delay));
+    }
+
+    return newKeys;
+  }
+
+  let dealerKeys = [];
+  let handRows = [];   // { block, row, total, label, keys } per hand index, persisted across renders
+
+  function renderDealer(dealer) {
+    dealerKeys = reconcileCards(el.dealerCards, dealerKeys, dealer.cards);
+    if (dealer.total !== null && dealer.total !== undefined) {
+      el.dealerTotal.style.display = "block";
+      el.dealerTotal.textContent = dealer.total;
+      el.dealerTotal.className = "hand-total" + (dealer.total > 21 ? " bust" : "");
+    } else {
+      el.dealerTotal.style.display = "none";
+    }
+  }
+
+  function resetTableVisuals() {
+    dealerKeys = [];
+    handRows = [];
+    el.dealerCards.innerHTML = "";
+    el.dealerTotal.style.display = "none";
+    el.handsZone.innerHTML = "";
+  }
+
+  function renderHands(hands, activeIdx) {
+    if (handRows.length !== hands.length) {
+      // structural change (split just happened, or a fresh deal replacing
+      // a previous round's hands) - rebuild the hand blocks from scratch
+      el.handsZone.innerHTML = "";
+      handRows = hands.map(() => {
+        const block = document.createElement("div");
+        block.className = "hand-block";
+        const label = document.createElement("div");
+        label.className = "zone-label";
+        const row = document.createElement("div");
+        row.className = "card-row";
+        const total = document.createElement("div");
+        total.className = "hand-total";
+        block.appendChild(label);
+        block.appendChild(row);
+        block.appendChild(total);
+        el.handsZone.appendChild(block);
+        return { block, row, total, label, keys: [] };
+      });
+    }
+
+    hands.forEach((h, i) => {
+      const r = handRows[i];
+      r.block.className = "hand-block" + (i === activeIdx ? " active-hand" : hands.length > 1 ? " inactive" : "");
+      r.label.textContent = hands.length > 1 ? "Hand " + (i + 1) : "You";
+      r.keys = reconcileCards(r.row, r.keys, h.cards);
+
+      let cls = "hand-total";
+      if (h.status === "bust") cls += " bust";
+      else if (h.result === "win") cls += " win";
+      else if (h.result === "push") cls += " push";
+      r.total.className = cls;
+      r.total.textContent = h.total + (h.status === "bust" ? " · bust" : "");
+    });
+  }
+
+  function renderActionsForHand(hand) {
+    el.actionbar.innerHTML = "";
+    const hit = document.createElement("button");
+    hit.className = "action-btn btn-hit";
+    hit.textContent = "Hit";
+    hit.disabled = !hand.can_hit;
+    hit.onclick = () => doAction("hit");
+    el.actionbar.appendChild(hit);
+
+    const stand = document.createElement("button");
+    stand.className = "action-btn btn-stand";
+    stand.textContent = "Stand";
+    stand.onclick = () => doAction("stand");
+    el.actionbar.appendChild(stand);
+
+    const dbl = document.createElement("button");
+    dbl.className = "action-btn btn-double";
+    dbl.textContent = "Double";
+    dbl.disabled = !hand.can_double;
+    dbl.onclick = () => doAction("double");
+    el.actionbar.appendChild(dbl);
+
+    const split = document.createElement("button");
+    split.className = "action-btn btn-split";
+    split.textContent = "Split";
+    split.disabled = !hand.can_split;
+    split.onclick = () => doAction("split");
+    el.actionbar.appendChild(split);
+  }
+
+  function renderAgainAction() {
+    el.actionbar.innerHTML = "";
+    const btn = document.createElement("button");
+    btn.className = "main-btn btn-again";
+    btn.textContent = "Play Again";
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = "Resetting table...";
+      try {
+        const state = await apiPost("/api/blackjack/again", { init_data: initData, token });
+        render(state);
+      } catch (e) {
+        showToast(e.message);
+        btn.disabled = false;
+        btn.textContent = "Play Again";
+      }
+    };
+    el.actionbar.appendChild(btn);
+  }
+
+  function showResultBanner(state) {
+    const results = state.hands.map((h) => h.result);
+    let cls = "push", text = "PUSH";
+    if (results.includes("win") && !results.includes("lose")) { cls = "win"; text = "YOU WIN"; }
+    else if (results.every((r) => r === "lose")) { cls = "lose"; text = "DEALER WINS"; }
+    else if (results.includes("win")) { cls = "win"; text = "MIXED RESULT"; }
+    el.resultBanner.className = "show " + cls;
+    el.resultBanner.textContent = text;
+    if (tg && tg.HapticFeedback) {
+      tg.HapticFeedback.notificationOccurred(cls === "win" ? "success" : cls === "lose" ? "error" : "warning");
+    }
+  }
+
+  function render(state) {
+    setBalance(state.balance);
+
+    if (state.status === "pending") {
+      el.idlePanel.style.display = "flex";
+      resetTableVisuals();
+      el.resultBanner.className = "";
+      el.actionbar.innerHTML = "";
+      el.actionbar.appendChild(el.btnDeal);
+      el.btnDeal.disabled = false;
+      el.btnDeal.textContent = "Deal";
+      if (state.amount !== undefined) {
+        el.betAmount.value = Number(state.amount).toFixed(2);
+      }
+      return;
+    }
+
+    el.idlePanel.style.display = "none";
+    renderDealer(state.dealer);
+    renderHands(state.hands, state.active_hand_index);
+
+    if (state.status === "active") {
+      el.resultBanner.className = "";
+      renderActionsForHand(state.hands[state.active_hand_index]);
+    } else if (state.status === "done") {
+      showResultBanner(state);
+      renderAgainAction();
+    }
+  }
+
+  async function apiPost(path, body) {
+    const res = await fetch(API_BASE + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Something went wrong");
+    return data;
+  }
+
+  async function apiGet(path) {
+    const res = await fetch(API_BASE + path, { cache: "no-store" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Something went wrong");
+    return data;
+  }
+
+  async function doDeal() {
+    el.btnDeal.disabled = true;
+    el.btnDeal.textContent = "Dealing...";
+    try {
+      const amount = parseFloat(el.betAmount.value) || undefined;
+      const state = await apiPost("/api/blackjack/start", { init_data: initData, token, amount });
+      render(state);
+    } catch (e) {
+      showToast(e.message);
+      el.btnDeal.disabled = false;
+      el.btnDeal.textContent = "Deal";
+    }
+  }
+
+  async function doAction(action) {
+    Array.from(el.actionbar.querySelectorAll("button")).forEach((b) => (b.disabled = true));
+    try {
+      const state = await apiPost("/api/blackjack/" + action, { init_data: initData, token });
+      render(state);
+    } catch (e) {
+      showToast(e.message);
+      try {
+        const state = await apiGet("/api/blackjack/info?token=" + encodeURIComponent(token));
+        render(state);
+      } catch (e2) { /* keep whatever's on screen */ }
+    }
+  }
+
+  async function bootstrap() {
+    try {
+      const state = await apiGet("/api/blackjack/info?token=" + encodeURIComponent(token));
+      if (state.status === "pending") {
+        el.betAmount.value = Number(state.amount).toFixed(2);
+      }
+      render(state);
+    } catch (e) {
+      showToast("Couldn't load this table - it may have expired");
+      el.btnDeal.disabled = true;
+    }
+  }
+
+  el.btnDeal.addEventListener("click", doDeal);
+  bootstrap();
+})();
+</script>
+</body>
+</html>

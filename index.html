@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Crash</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Inter:wght@400;500;600;700&display=swap');
+
+  :root {
+    --void: #080a14;
+    --deep: #10152a;
+    --panel: #161c38;
+    --ember: #ff6a3d;
+    --ember-hot: #ffb648;
+    --gold: #ffd166;
+    --indigo: #8b93ff;
+    --crimson: #ff4d6a;
+    --mist: #7b84ad;
+    --text: #eef0ff;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--void);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  #app {
+    position: relative;
+    height: 100dvh;
+    width: 100vw;
+    display: flex;
+    flex-direction: column;
+    background:
+      radial-gradient(120% 60% at 50% 0%, rgba(139,147,255,0.10), transparent 60%),
+      radial-gradient(140% 90% at 50% 100%, rgba(255,106,61,0.08), transparent 55%),
+      var(--void);
+  }
+
+  /* ---- top status bar ---- */
+  #topbar {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 18px 8px;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    color: var(--mist);
+    text-transform: uppercase;
+  }
+  #topbar b { color: var(--text); font-weight: 700; }
+  #balance-pill {
+    background: var(--panel);
+    border: 1px solid rgba(255,255,255,0.06);
+    padding: 6px 12px;
+    border-radius: 100px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--gold);
+  }
+
+  /* ---- canvas stage ---- */
+  #stage-wrap {
+    position: relative;
+    flex: 1;
+    margin: 4px 12px 0;
+    border-radius: 20px;
+    overflow: hidden;
+    background: linear-gradient(180deg, var(--deep) 0%, #0b0f22 100%);
+    border: 1px solid rgba(255,255,255,0.05);
+  }
+  canvas#stage { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+  #multiplier {
+    position: absolute; left: 0; right: 0; top: 38%;
+    text-align: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 800;
+    font-size: 15vw;
+    line-height: 1;
+    letter-spacing: -0.02em;
+    color: var(--text);
+    text-shadow: 0 0 40px rgba(139,147,255,0.35);
+    transition: color 0.2s ease;
+    pointer-events: none;
+    user-select: none;
+  }
+  #multiplier.hot { color: var(--ember-hot); text-shadow: 0 0 50px rgba(255,182,72,0.5); }
+  #multiplier.crashed { color: var(--crimson); text-shadow: 0 0 40px rgba(255,77,106,0.55); }
+  #multiplier.won { color: var(--gold); text-shadow: 0 0 50px rgba(255,209,102,0.6); }
+
+  #substatus {
+    position: absolute; left: 0; right: 0; top: 60%;
+    text-align: center;
+    font-size: 13px;
+    color: var(--mist);
+    letter-spacing: 0.03em;
+    pointer-events: none;
+  }
+
+  #cashout-readout {
+    text-align: center;
+    font-size: 14px;
+    color: var(--mist);
+    padding: 10px 0 2px;
+    letter-spacing: 0.02em;
+  }
+  #cashout-readout b {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--ember-hot);
+    font-weight: 700;
+  }
+  #cashout-readout.hidden { display: none; }
+
+  /* ---- idle / bet setup panel ---- */
+  #idle-panel {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px;
+    background: rgba(8,10,20,0.72);
+    backdrop-filter: blur(6px);
+  }
+  #idle-panel .label { font-size: 12px; letter-spacing: 0.08em; color: var(--mist); text-transform: uppercase; }
+  #bet-amount {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 42px; font-weight: 700; color: var(--text);
+    background: transparent; border: none; text-align: center; width: 60%;
+    border-bottom: 2px solid rgba(255,255,255,0.12);
+    padding-bottom: 6px;
+  }
+  #bet-amount:focus { outline: none; border-color: var(--indigo); }
+
+  /* ---- bottom action bar ---- */
+  #actionbar { padding: 14px 18px calc(18px + env(safe-area-inset-bottom)); }
+  button.main-btn {
+    width: 100%;
+    padding: 18px;
+    border-radius: 16px;
+    border: none;
+    font-family: 'Inter', sans-serif;
+    font-weight: 700;
+    font-size: 17px;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    transition: transform 0.08s ease, opacity 0.2s ease;
+  }
+  button.main-btn:active { transform: scale(0.97); }
+  button.main-btn:disabled { opacity: 0.45; }
+
+  .btn-launch { background: linear-gradient(135deg, var(--indigo), #6a73e6); color: #fff; }
+  .btn-cashout { background: linear-gradient(135deg, var(--gold), var(--ember)); color: #1a1200; }
+  .btn-again { background: var(--panel); color: var(--text); border: 1px solid rgba(255,255,255,0.08); }
+
+  #error-toast {
+    position: absolute; left: 18px; right: 18px; bottom: 100px;
+    background: rgba(255,77,106,0.14);
+    border: 1px solid rgba(255,77,106,0.4);
+    color: #ffd7dd;
+    padding: 10px 14px;
+    border-radius: 12px;
+    font-size: 13px;
+    text-align: center;
+    display: none;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div id="topbar">
+    <div>🚀 <b>CRASH</b></div>
+    <div id="balance-pill">$--.--</div>
+  </div>
+
+  <div id="stage-wrap">
+    <canvas id="stage"></canvas>
+    <div id="multiplier">1.00x</div>
+    <div id="substatus">place a bet to launch</div>
+
+    <div id="idle-panel">
+      <div class="label">Bet Amount</div>
+      <input id="bet-amount" type="number" inputmode="decimal" step="0.10" min="0.10" value="10.00" readonly />
+    </div>
+  </div>
+
+  <div id="cashout-readout" class="hidden">Cash out now: <b>$0.00</b></div>
+
+  <div id="error-toast"></div>
+
+  <div id="actionbar">
+    <button id="btn-launch" class="main-btn btn-launch">Launch</button>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  if (tg) { tg.ready(); tg.expand(); }
+  const initData = tg ? tg.initData : "";
+
+  // The launch pad token identifies which bet this page belongs to - the
+  // bot puts it in the URL as /crash/<token>, so every API call includes it.
+  const token = location.pathname.split("/").filter(Boolean).pop();
+
+  const params = new URLSearchParams(location.search);
+  const prefillAmount = parseFloat(params.get("amount") || "10");
+  // API is served same-origin by crash_web.py, right alongside this page.
+  const API_BASE = params.get("api") ? decodeURIComponent(params.get("api")) : "";
+
+  const GROWTH_RATE = Math.log(2) / 5.0; // mirrors server's CRASH_GROWTH_RATE (CRASH_DOUBLE_SECONDS=5.0 in main.py)
+
+  const el = {
+    multiplier: document.getElementById("multiplier"),
+    substatus: document.getElementById("substatus"),
+    cashoutReadout: document.getElementById("cashout-readout"),
+    idlePanel: document.getElementById("idle-panel"),
+    betAmount: document.getElementById("bet-amount"),
+    balance: document.getElementById("balance-pill"),
+    actionbar: document.getElementById("actionbar"),
+    btnLaunch: document.getElementById("btn-launch"),
+    toast: document.getElementById("error-toast"),
+    canvas: document.getElementById("stage"),
+  };
+  el.betAmount.value = prefillAmount.toFixed(2);
+
+  const ctx = el.canvas.getContext("2d");
+  function resizeCanvas() {
+    const rect = el.canvas.parentElement.getBoundingClientRect();
+    el.canvas.width = rect.width * devicePixelRatio;
+    el.canvas.height = rect.height * devicePixelRatio;
+  }
+  resizeCanvas();
+  window.addEventListener("resize", resizeCanvas);
+
+  let state = "idle"; // idle | running | crashed | cashed
+  let startPerf = null;
+  let rafId = null;
+  let exitRafId = null; // separate rAF handle for the post-crash burst effect
+  let trail = []; // {x, y} — used only for the soft area fill under the chart
+  let candles = []; // {x, open, close, high, low, bullish} — the stock-chart bars
+  let lastCandleAt = -1; // elapsed seconds when the last candle was committed
+  let particles = []; // {x, y, vx, vy, life}
+  let pollTimer = null;
+  let pollController = null; // lets us abort an in-flight long-poll the instant cashout is clicked
+  let lastMarker = { x: 0, y: 0 }; // last known live-price marker position
+
+  function showToast(msg) {
+    el.toast.textContent = msg;
+    el.toast.style.display = "block";
+    setTimeout(() => (el.toast.style.display = "none"), 2600);
+  }
+
+  function currentMultiplier(elapsedSeconds) {
+    return Math.floor(Math.exp(GROWTH_RATE * elapsedSeconds) * 100) / 100;
+  }
+
+  function setBalance(v) {
+    el.balance.textContent = "$" + Number(v).toFixed(2);
+  }
+
+  function resetIdle() {
+    state = "idle";
+    if (exitRafId) { cancelAnimationFrame(exitRafId); exitRafId = null; }
+    el.idlePanel.style.display = "flex";
+    el.cashoutReadout.classList.add("hidden");
+    el.multiplier.textContent = "1.00x";
+    el.multiplier.className = "";
+    el.substatus.textContent = "place a bet to launch";
+    el.actionbar.innerHTML = "";
+    el.actionbar.appendChild(el.btnLaunch);
+    el.btnLaunch.disabled = false;
+    el.btnLaunch.textContent = "Launch";
+    trail = []; particles = []; candles = []; lastCandleAt = -1;
+    stopPolling();
+    drawFrame(0, false);
+  }
+
+  function lerpChannel(a, b, t) { return Math.round(a + (b - a) * t); }
+
+  // Radial sunburst behind everything, colour-shifting from purple (low
+  // multiplier) toward red/pink (high multiplier), matching the reference.
+  function drawBackgroundRays(w, h, heat) {
+    const purple = [139, 92, 246];
+    const crimson = [255, 61, 90];
+    const r = lerpChannel(purple[0], crimson[0], heat);
+    const g = lerpChannel(purple[1], crimson[1], heat);
+    const b = lerpChannel(purple[2], crimson[2], heat);
+
+    const cx = w * 0.5, cy = h * 0.4;
+    const maxR = Math.max(w, h) * 0.95;
+    const rot = (performance.now() / 9000) % (Math.PI * 2);
+    const rays = 28;
+
+    for (let i = 0; i < rays; i++) {
+      const a0 = rot + (Math.PI * 2 / rays) * i;
+      const a1 = a0 + (Math.PI / rays) * 0.55;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + Math.cos(a0) * maxR, cy + Math.sin(a0) * maxR);
+      ctx.lineTo(cx + Math.cos(a1) * maxR, cy + Math.sin(a1) * maxR);
+      ctx.closePath();
+      ctx.fillStyle = `rgba(${r},${g},${b},${i % 2 === 0 ? 0.11 : 0.04})`;
+      ctx.fill();
+    }
+
+    const glow = ctx.createRadialGradient(cx, cy, 0, cx, cy, maxR * 0.7);
+    glow.addColorStop(0, `rgba(${r},${g},${b},0.35)`);
+    glow.addColorStop(0.55, `rgba(${r},${g},${b},0.08)`);
+    glow.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, w, h);
+  }
+
+  function drawStarfield(w, h) {
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    for (let i = 0; i < 40; i++) {
+      const sx = (i * 97) % w;
+      const sy = (i * 53) % (h * 0.7);
+      ctx.globalAlpha = 0.15 + (i % 5) * 0.05;
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Soft translucent area under the climb, like the shaded region under a
+  // stock chart line. Pure render — doesn't push new points, so it's safe
+  // to call repeatedly during the post-crash freeze without moving.
+  function drawAreaFill(w, h, heat) {
+    if (trail.length < 2) return;
+    const rr = lerpChannel(255, 255, heat);
+    const gg = lerpChannel(61, 122, heat);
+    const bb = lerpChannel(90, 61, heat);
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, `rgba(${rr},${gg},${bb},0.28)`);
+    grad.addColorStop(1, `rgba(${rr},${gg},${bb},0)`);
+
+    ctx.beginPath();
+    ctx.moveTo(trail[0].x, h);
+    trail.forEach((p) => ctx.lineTo(p.x, p.y));
+    ctx.lineTo(trail[trail.length - 1].x, h);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+  }
+
+  // Stock-market style candlestick chart along the climb path — green
+  // (bullish) candles when the price ticked up since the last one, red
+  // when it dipped, each with a thin high/low wick. Pure render.
+  function drawCandles(w) {
+    const bw = 5 * devicePixelRatio;
+    candles.forEach((c) => {
+      const color = c.bullish ? "#2ee6a8" : "#ff4d6a";
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5 * devicePixelRatio;
+      ctx.beginPath();
+      ctx.moveTo(c.x, c.high);
+      ctx.lineTo(c.x, c.low);
+      ctx.stroke();
+
+      ctx.fillStyle = color;
+      const top = Math.min(c.open, c.close);
+      const bodyH = Math.max(Math.abs(c.close - c.open), 1.5 * devicePixelRatio);
+      ctx.fillRect(c.x - bw / 2, top, bw, bodyH);
+    });
+  }
+
+  // Live-price marker — pulsing ring + core dot, with a dashed guide line
+  // out to the edge of the chart, like a trading platform's current-price
+  // indicator. Replaces the old plane.
+  function drawMarker(x, y, w, alpha, heat) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    const pulse = (performance.now() / 550) % 1;
+    ctx.strokeStyle = `rgba(255,255,255,${0.5 * (1 - pulse)})`;
+    ctx.lineWidth = 2 * devicePixelRatio;
+    ctx.beginPath();
+    ctx.arc(x, y, (9 + pulse * 16) * devicePixelRatio, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.setLineDash([4 * devicePixelRatio, 5 * devicePixelRatio]);
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 1.5 * devicePixelRatio;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(w - 3 * devicePixelRatio, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.arc(x, y, 5.5 * devicePixelRatio, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = heat > 0.5 ? "#ff4d6a" : "#2ee6a8";
+    ctx.beginPath();
+    ctx.arc(x, y, 3 * devicePixelRatio, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function drawFrame(elapsed, live) {
+    const w = el.canvas.width, h = el.canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const mult0 = live ? currentMultiplier(elapsed) : 1;
+    const heat0 = Math.min((mult0 - 1) / 4, 1);
+    drawBackgroundRays(w, h, heat0);
+    drawStarfield(w, h);
+
+    if (!live) return;
+
+    const mult = mult0;
+    // Asymptotic progress: keeps creeping toward the top/right edge no
+    // matter how long the round runs, but mathematically never reaches
+    // (let alone exceeds) it.
+    const progress = elapsed / (elapsed + 10);
+    let px = 0.08 * w + progress * 0.72 * w;
+    let py = 0.85 * h - progress * 0.72 * h;
+    // Hard safety clamp, independent of the formula above — guarantees the
+    // point can never actually leave the visible canvas, no matter what.
+    px = Math.min(px, w * 0.94);
+    py = Math.max(py, h * 0.08);
+
+    trail.push({ x: px, y: py });
+    // Keep the FULL history for the round (cleared each new round in
+    // resetIdle) — capping this at a small number was throwing away the
+    // early part of the curve every couple of seconds, making the line
+    // look like it kept erasing itself instead of growing into a full curve.
+    if (trail.length > 6000) trail.shift();
+
+    // heat color ramps from purple toward red as multiplier climbs
+    const heat = Math.min((mult - 1) / 4, 1);
+    drawAreaFill(w, h, heat);
+
+    // commit a new candle roughly every 130ms of round time — this is what
+    // gives the "stock market" texture instead of a smooth plane curve
+    if (elapsed - lastCandleAt > 0.13) {
+      const prevClose = candles.length ? candles[candles.length - 1].close : py;
+      const jitter = 9 * devicePixelRatio;
+      const open = prevClose;
+      const close = py + (Math.random() - 0.5) * jitter;
+      const wick = Math.random() * jitter * 0.7;
+      candles.push({
+        x: px,
+        open, close,
+        high: Math.min(open, close) - wick,
+        low: Math.max(open, close) + wick,
+        bullish: close <= open, // smaller y = higher up = price went up
+      });
+      if (candles.length > 90) candles.shift();
+      lastCandleAt = elapsed;
+    }
+    drawCandles(w);
+
+    // exhaust particles
+    if (Math.random() < 0.7) {
+      particles.push({
+        x: px, y: py,
+        vx: (Math.random() - 0.7) * 2 * devicePixelRatio,
+        vy: (Math.random() * 1.5 + 0.5) * devicePixelRatio,
+        life: 1,
+      });
+    }
+    particles.forEach((p) => {
+      p.x += p.vx; p.y += p.vy; p.life -= 0.035;
+    });
+    particles = particles.filter((p) => p.life > 0);
+    particles.forEach((p) => {
+      ctx.globalAlpha = Math.max(p.life, 0);
+      ctx.fillStyle = heat > 0.5 ? "#ff8fa3" : "#e5384f";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3 * devicePixelRatio * p.life, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+
+    drawMarker(px, py, w, 1, heat);
+    lastMarker = { x: px, y: py };
+  }
+
+  // Post-crash: the chart freezes exactly as it stands (candles + area
+  // stay put — nothing "disappears"), while the live marker bursts into a
+  // quick expanding red ring and fades, like a trading-app crash alert.
+  function runCrashEffect() {
+    const w = el.canvas.width, h = el.canvas.height;
+    const { x, y } = lastMarker;
+    const start = performance.now();
+
+    function step() {
+      const t = (performance.now() - start) / 1000;
+
+      ctx.clearRect(0, 0, w, h);
+      drawBackgroundRays(w, h, 1);
+      drawStarfield(w, h);
+      drawAreaFill(w, h, 1);
+      drawCandles(w);
+
+      const alpha = Math.max(1 - t / 0.6, 0);
+      if (alpha > 0) {
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.strokeStyle = "#ff4d6a";
+        ctx.lineWidth = 3 * devicePixelRatio;
+        ctx.beginPath();
+        ctx.arc(x, y, (8 + t * 70) * devicePixelRatio, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillStyle = "#ff4d6a";
+        ctx.beginPath();
+        ctx.arc(x, y, 4 * devicePixelRatio, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      if (t < 0.65) {
+        exitRafId = requestAnimationFrame(step);
+      } else {
+        exitRafId = null;
+      }
+    }
+    step();
+  }
+
+  function loop() {
+    if (state !== "running") return;
+    const elapsed = (performance.now() - startPerf) / 1000;
+    const mult = currentMultiplier(elapsed);
+    el.multiplier.textContent = mult.toFixed(2) + "x";
+    el.multiplier.className = mult >= 2 ? "hot" : "";
+    const payout = parseFloat(el.betAmount.value || "0") * mult;
+    el.cashoutReadout.innerHTML = "Cash out now: <b>$" + payout.toFixed(2) + "</b>";
+    drawFrame(elapsed, true);
+    rafId = requestAnimationFrame(loop);
+  }
+
+  async function apiPost(path, body) {
+    const res = await fetch(API_BASE + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Something went wrong");
+    return data;
+  }
+
+  async function apiGet(path, signal) {
+    const res = await fetch(API_BASE + path, signal ? { signal } : undefined);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Something went wrong");
+    return data;
+  }
+
+  function renderRunningActions() {
+    el.actionbar.innerHTML = "";
+    const btn = document.createElement("button");
+    btn.className = "main-btn btn-cashout";
+    btn.textContent = "Cash Out";
+    btn.onclick = doCashout;
+    el.actionbar.appendChild(btn);
+  }
+
+  function renderAgainAction() {
+    el.actionbar.innerHTML = "";
+    const btn = document.createElement("button");
+    btn.className = "main-btn btn-again";
+    btn.textContent = tg ? "Close & Play Again" : "Play Again";
+    btn.onclick = () => {
+      if (tg) { tg.close(); }
+      else { el.substatus.textContent = "send /crash again in the chat for another round"; }
+    };
+    el.actionbar.appendChild(btn);
+  }
+
+  async function doLaunch() {
+    el.btnLaunch.disabled = true;
+    el.btnLaunch.textContent = "Launching...";
+    try {
+      const data = await apiPost("/api/crash/start", { init_data: initData, token });
+      setBalance(data.balance);
+      el.idlePanel.style.display = "none";
+      el.cashoutReadout.classList.remove("hidden");
+      el.substatus.textContent = "bet locked in — cash out any time";
+      state = "running";
+      startPerf = performance.now();
+      renderRunningActions();
+      loop();
+      startPolling();
+    } catch (e) {
+      showToast(e.message);
+      el.btnLaunch.disabled = false;
+      el.btnLaunch.textContent = "Launch";
+    }
+  }
+
+  let pollAbort = false;
+
+  async function pollState() {
+    if (state !== "running") return;
+    const controller = new AbortController();
+    pollController = controller;
+    try {
+      const data = await apiGet("/api/crash/state?token=" + encodeURIComponent(token), controller.signal);
+      if (data.crashed) {
+        onCrashed(data.crash_point);
+        return;
+      }
+    } catch (e) { /* aborted, or network hiccup - either way keep animating; the next poll may recover */ }
+    if (state === "running" && !pollAbort) {
+      pollTimer = setTimeout(pollState, 30);
+    }
+  }
+
+  function startPolling() {
+    pollAbort = false;
+    pollState();
+  }
+
+  function stopPolling() {
+    pollAbort = true;
+    clearTimeout(pollTimer);
+    if (pollController) {
+      pollController.abort(); // frees the connection immediately instead of letting the up-to-4s long-poll linger
+      pollController = null;
+    }
+  }
+
+  function onCrashed(crashPoint) {
+    if (state !== "running") return;
+    state = "crashed";
+    cancelAnimationFrame(rafId);
+    stopPolling();
+    el.multiplier.textContent = crashPoint.toFixed(2) + "x";
+    el.multiplier.className = "crashed";
+    el.substatus.textContent = "crashed — bet lost";
+    el.cashoutReadout.classList.add("hidden");
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("error");
+    runCrashEffect();
+    renderAgainAction();
+  }
+
+  async function doCashout() {
+    if (state !== "running") return;
+    stopPolling(); // kill the in-flight long-poll first so it can't queue ahead of this request
+    cancelAnimationFrame(rafId);
+    el.actionbar.innerHTML = "";
+    const busy = document.createElement("button");
+    busy.className = "main-btn btn-cashout";
+    busy.disabled = true;
+    busy.textContent = "Cashing out...";
+    el.actionbar.appendChild(busy);
+
+    try {
+      const data = await apiPost("/api/crash/cashout", { init_data: initData, token });
+      setBalance(data.balance);
+      if (data.result === "cashed_out") {
+        state = "cashed";
+        el.cashoutReadout.classList.add("hidden");
+        el.multiplier.textContent = data.multiplier.toFixed(2) + "x";
+        el.multiplier.className = "won";
+        el.substatus.textContent = "+$" + data.profit.toFixed(2) + " profit";
+        if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+      } else {
+        onCrashed(data.crash_point);
+      }
+    } catch (e) {
+      showToast(e.message);
+    } finally {
+      renderAgainAction();
+    }
+  }
+
+  async function bootstrap() {
+    try {
+      const data = await apiGet("/api/crash/info?token=" + encodeURIComponent(token));
+      setBalance(data.balance);
+      el.betAmount.value = Number(data.amount).toFixed(2);
+
+      if (data.status === "active") {
+        el.idlePanel.style.display = "none";
+        el.cashoutReadout.classList.remove("hidden");
+        el.substatus.textContent = "bet locked in — cash out any time";
+        state = "running";
+        startPerf = performance.now() - data.elapsed_ms;
+        renderRunningActions();
+        loop();
+        startPolling();
+      } else if (data.status === "crashed") {
+        onCrashed(data.crash_point);
+      } else if (data.status === "cashed_out") {
+        state = "cashed";
+        el.idlePanel.style.display = "none";
+        el.cashoutReadout.classList.add("hidden");
+        el.multiplier.textContent = data.multiplier.toFixed(2) + "x";
+        el.multiplier.className = "won";
+        el.substatus.textContent = "already cashed out";
+        renderAgainAction();
+      }
+    } catch (e) {
+      showToast("Couldn't load this launch pad — it may have expired");
+      el.btnLaunch.disabled = true;
+    }
+  }
+
+  el.btnLaunch.addEventListener("click", doLaunch);
+  drawFrame(0, false);
+  bootstrap();
+})();
+</script>
+</body>
+</html>
