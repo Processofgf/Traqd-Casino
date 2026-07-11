@@ -3826,7 +3826,14 @@ def handle_message(message):
         # Not a command - might be a reply to a /deposit or /withdraw prompt
         # (a bare amount, or a wallet address). Let that flow claim it;
         # otherwise there's nothing else this bot does with free text.
-        if text:
+        # IMPORTANT: deposit/withdraw are DM-only flows (see handle_deposit_command)
+        # - pending_deposit_flow/pending_withdraw_flow are keyed by user_id only,
+        # with no chat_id check, so without this guard a user typing a plain
+        # number in ANY group they're in (e.g. "10" as unrelated chat) gets
+        # misread as their deposit amount and the invoice - amount + pay
+        # address - gets posted into that group instead of their DM.
+        chat_type = message["chat"].get("type", "private")
+        if text and chat_type == "private":
             username = message["from"].get("first_name", "Player")
             try_handle_payment_flow_message(chat_id, user_id, username, text)
         return
