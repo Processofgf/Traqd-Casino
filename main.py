@@ -250,7 +250,7 @@ def fmt_balance(user_id, usd_amount=None):
     else:
         value = usd_amount
 
-    return f"{meta['emoji']} {value:.{meta['decimals']}f} {meta['label']}"
+    return f'<tg-emoji emoji-id="{meta["icon_id"]}">{meta["emoji"]}</tg-emoji> {value:.{meta["decimals"]}f} {meta["label"]}'
 
 
 def resolve_bet_amount(user_id, raw_text):
@@ -929,7 +929,7 @@ def start_deposit_amount_prompt(chat_id, user_id, username, coin):
     meta = DEPOSIT_COINS[coin]
     send_message(
         chat_id,
-        f"{meta['emoji']} <b>{meta['label']} Deposit</b>\n\n"
+        f'<tg-emoji emoji-id="{meta["icon_id"]}">{meta["emoji"]}</tg-emoji> <b>{meta["label"]} Deposit</b>\n\n'
         f"Reply with the USD amount you want to deposit (min ${MIN_DEPOSIT:.2f}).\n"
         f"Example: <code>25</code>"
     )
@@ -942,7 +942,7 @@ def start_withdraw_amount_prompt(chat_id, user_id, username, coin):
     meta = DEPOSIT_COINS[coin]
     send_message(
         chat_id,
-        f"{meta['emoji']} <b>{meta['label']} Withdrawal</b>\n\n"
+        f'<tg-emoji emoji-id="{meta["icon_id"]}">{meta["emoji"]}</tg-emoji> <b>{meta["label"]} Withdrawal</b>\n\n'
         f"Withdrawable balance: <b>${withdrawable:.2f}</b>\n\n"
         f"Reply with the USD amount you want to withdraw (min ${MIN_WITHDRAW:.2f}).\n"
         f"Example: <code>20</code>"
@@ -1053,7 +1053,7 @@ def process_deposit_amount(chat_id, user_id, username, text):
 
     send_message(
         chat_id,
-        f"{meta['emoji']} <b>Send exactly this to complete your deposit:</b>\n\n"
+        f'<tg-emoji emoji-id="{meta["icon_id"]}">{meta["emoji"]}</tg-emoji> <b>Send exactly this to complete your deposit:</b>\n\n'
         f"Amount: <code>{pay_amount}</code> {coin.upper()}\n"
         f"Address:\n<code>{pay_address}</code>\n\n"
         f"Your balance updates automatically once the network confirms it - "
@@ -1088,7 +1088,7 @@ def process_withdraw_amount(chat_id, user_id, username, text):
     meta = DEPOSIT_COINS[flow["coin"]]
     send_message(
         chat_id,
-        f"{meta['emoji']} Now reply with your <b>{meta['label']}</b> wallet address to receive ${usd_amount:.2f}."
+        f'<tg-emoji emoji-id="{meta["icon_id"]}">{meta["emoji"]}</tg-emoji> Now reply with your <b>{meta["label"]}</b> wallet address to receive ${usd_amount:.2f}.'
     )
     return True
 
@@ -1220,7 +1220,7 @@ def process_withdraw_address(chat_id, user_id, username, text):
             withdraw_requests[withdraw_id]["batch_id"] = detail.get("batch_id")
         send_message(
             chat_id,
-            f"{meta['emoji']} <b>Withdrawal received!</b>\n\n"
+            f'<tg-emoji emoji-id="{meta["icon_id"]}">{meta["emoji"]}</tg-emoji> <b>Withdrawal received!</b>\n\n'
             f"Amount: <b>${usd_amount:.2f}</b>\n"
             f"Coin: {meta['label']}\n\n"
             f"It's queued and pending confirmation - this can take a little longer than usual. "
@@ -1236,7 +1236,7 @@ def process_withdraw_address(chat_id, user_id, username, text):
     new_balance = get_balance(user_id)
     send_message(
         chat_id,
-        f"{meta['emoji']} <b>Withdrawal submitted!</b>\n\n"
+        f'<tg-emoji emoji-id="{meta["icon_id"]}">{meta["emoji"]}</tg-emoji> <b>Withdrawal submitted!</b>\n\n'
         f"Amount: <b>${usd_amount:.2f}</b>\n"
         f"Coin: {meta['label']}\n"
         f"Address: <code>{address}</code>\n\n"
