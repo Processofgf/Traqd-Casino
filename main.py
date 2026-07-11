@@ -47,7 +47,7 @@ STARTING_BALANCE = 0.00
 MIN_BET = 0.10
 MAX_BET = 5000.00
 
-MIN_DEPOSIT = 5.00
+MIN_DEPOSIT = 3.00
 MIN_WITHDRAW = 10.00
 FIRST_DEPOSIT_BONUS_PCT = 1.30     # 130% match on the very first deposit
 BONUS_WAGER_MULTIPLIER = 50        # bonus funds need 50x wagered before withdrawal
