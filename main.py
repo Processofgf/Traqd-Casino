@@ -81,6 +81,11 @@ CURRENCY_LOCK = threading.Lock()
 known_usernames = {}  # lowercased @username (no @) -> user_id, for /tip lookups
 all_known_user_ids = set()  # every user_id who's ever messaged the bot, for /broadcast
 KNOWN_USERS_LOCK = threading.Lock()
+test_fund_grants = {}  # user_id -> {"token", "original_wager_required", "total_test_amount"}
+                        # so a stale expiry timer never wipes a newer /testfund grant
+                        # and any pre-existing real bonus wager state can be restored
+MAX_TESTFUND = 100.00
+TESTFUND_LIFETIME_SECONDS = 3 * 3600  # 3 hours
 SUPPORTED_CURRENCIES = {
     "usd": {"label": "USD", "emoji": "💵", "decimals": 2, "icon_id": "5409048419211682843"},
     "inr": {"label": "INR", "emoji": "🇮🇳", "decimals": 2, "icon_id": "5296467211735539812"},
@@ -4513,6 +4518,89 @@ def handle_message(message):
             send_message(chat_id, f"✅ Broadcast complete. Sent: {sent}, Failed: {failed}.")
 
         threading.Thread(target=_run_broadcast, daemon=True).start()
+        return
+
+    if command == "/testfund":
+        # Admin-only, deliberately NOT listed in /help or the command menu.
+        # Grants play-money for testing games - it's added to the bonus
+        # pool with an unclearable wager requirement so it (and any
+        # winnings from it) can NEVER be converted to withdrawable real
+        # balance, and it's wiped after 3 hours regardless of whether it
+        # was played or not.
+        #
+        # IMPORTANT: if this account also has a real, legitimate bonus
+        # active (e.g. from an actual test deposit) with its own
+        # wager_required, we must not clobber that. So the ORIGINAL
+        # wager_required is captured once (on the first grant) and
+        # restored exactly at expiry - wager_progress is left completely
+        # untouched throughout, so any real wagering the account does
+        # during the test period still counts normally toward the real
+        # requirement. At expiry we only remove the cumulative amount
+        # actually granted (floored at 0, in case it was lost playing),
+        # never the account's other bonus funds.
+        if not is_admin(user_id):
+            return
+        if not args:
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/testfund 50</code> (max ${MAX_TESTFUND:.2f})")
+            return
+        try:
+            fund_amount = round(float(args[0]), 2)
+        except ValueError:
+            send_message(chat_id, f"{WARN_EMOJI} Please give a plain number, e.g. <code>/testfund 50</code>")
+            return
+        if fund_amount <= 0 or fund_amount > MAX_TESTFUND:
+            send_message(chat_id, f"{WARN_EMOJI} Amount must be between $0.01 and ${MAX_TESTFUND:.2f}")
+            return
+
+        grant_token = time.time()
+        with WALLET_LOCK:
+            w = _ensure_wallet(user_id)
+            existing = test_fund_grants.get(user_id)
+            if existing:
+                # Extending an already-active grant: keep the ORIGINAL
+                # pre-testfund wager_required we captured the first time,
+                # and accumulate the total amount to claw back at expiry.
+                original_wager_required = existing["original_wager_required"]
+                total_test_amount = round(existing["total_test_amount"] + fund_amount, 2)
+            else:
+                original_wager_required = w["wager_required"]
+                total_test_amount = fund_amount
+
+            w["bonus"] = round(w["bonus"] + fund_amount, 2)
+            w["wager_required"] = 10 ** 9  # effectively unclearable while a grant is active
+            _persist_wallet(user_id)
+
+        test_fund_grants[user_id] = {
+            "token": grant_token,
+            "original_wager_required": original_wager_required,
+            "total_test_amount": total_test_amount,
+        }
+
+        def _expire_testfund(uid, token):
+            time.sleep(TESTFUND_LIFETIME_SECONDS)
+            grant = test_fund_grants.get(uid)
+            if not grant or grant["token"] != token:
+                return  # a newer /testfund grant superseded this one - its own timer handles it
+            with WALLET_LOCK:
+                w2 = _ensure_wallet(uid)
+                w2["bonus"] = max(0.0, round(w2["bonus"] - grant["total_test_amount"], 2))
+                w2["wager_required"] = grant["original_wager_required"]
+                _persist_wallet(uid)
+            test_fund_grants.pop(uid, None)
+            try:
+                send_message(uid, f"{WARN_EMOJI} Your test funds have expired and been removed.")
+            except Exception:
+                pass
+
+        threading.Thread(target=_expire_testfund, args=(user_id, grant_token), daemon=True).start()
+
+        send_message(
+            chat_id,
+            f"🧪 Added <b>${fund_amount:.2f}</b> test funds.\n"
+            f"This money (and anything won with it) <b>cannot be withdrawn</b> "
+            f"and will be wiped in <b>3 hours</b>. Any real bonus you already "
+            f"had is untouched and will be restored to its normal state then."
+        )
         return
 
     if command == "/seed":
