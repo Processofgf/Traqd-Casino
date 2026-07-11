@@ -253,6 +253,33 @@ def fmt_balance(user_id, usd_amount=None):
     return f"{meta['emoji']} {value:.{meta['decimals']}f} {meta['label']}"
 
 
+def resolve_bet_amount(user_id, raw_text):
+    """Parses a bet amount the user typed, interpreting it in whichever
+    currency they've picked with /currency (default USD) and converting to
+    USD - the currency ALL wallet/betting logic runs in internally. This is
+    what makes /currency actually change what you PLAY with, not just how
+    the balance is displayed - a user on INR typing '100' means ₹100, not
+    $100. Returns (usd_amount, error) where error is None on success, or
+    one of "invalid_number" / "rate_unavailable"."""
+    try:
+        raw_value = float(raw_text)
+    except (ValueError, TypeError):
+        return None, "invalid_number"
+    if raw_value <= 0:
+        return None, "invalid_number"
+
+    currency = get_user_currency(user_id)
+    if currency == "usd":
+        return round(raw_value, 2), None
+
+    rates = _get_rates()
+    rate = rates.get("usd_inr") if currency == "inr" else rates.get("usd_ltc")
+    if not rate:
+        return None, "rate_unavailable"
+
+    return round(raw_value / rate, 2), None
+
+
 def spend_for_bet(user_id, amount):
     """Deducts a bet, taking from bonus balance first, then real. Returns
     (bonus_portion, real_portion) so the caller can credit winnings back
@@ -1680,10 +1707,12 @@ def handle_roulette_command(chat_id, user_id, username, args):
         send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Usage: <code>/roulette &lt;amount&gt;</code>\nExample: <code>/roulette 10</code>")
         return
 
-    try:
-        amount = float(args[0])
-    except ValueError:
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
         send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Invalid amount. Example: <code>/roulette 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
         return
 
     if amount < MIN_BET:
@@ -2514,10 +2543,17 @@ def handle_limbo_command(chat_id, user_id, username, args):
         return
 
     try:
-        amount = float(args[0])
         target = float(args[1])
     except ValueError:
         send_message(chat_id, f"{WARN_EMOJI} Invalid amount or target. Example: <code>/limbo 10 5.00</code>")
+        return
+
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
+        send_message(chat_id, f"{WARN_EMOJI} Invalid amount or target. Example: <code>/limbo 10 5.00</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
         return
 
     if amount < MIN_BET:
@@ -2610,10 +2646,12 @@ def handle_coinflip_command(chat_id, user_id, username, args):
         )
         return
 
-    try:
-        amount = float(args[0])
-    except ValueError:
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
         send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/coinflip 10 heads</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
         return
 
     guess = args[1].lower()
@@ -2771,10 +2809,12 @@ def handle_mines_command(chat_id, user_id, username, args):
         send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/mines &lt;amount&gt;</code>\nExample: <code>/mines 10</code>")
         return
 
-    try:
-        amount = float(args[0])
-    except ValueError:
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
         send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/mines 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
         return
 
     if amount < MIN_BET:
@@ -2920,10 +2960,12 @@ def handle_towers_command(chat_id, user_id, username, args):
         send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/towers &lt;amount&gt;</code>\nExample: <code>/towers 10</code>")
         return
 
-    try:
-        amount = float(args[0])
-    except ValueError:
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
         send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/towers 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
         return
 
     if amount < MIN_BET:
@@ -3084,10 +3126,12 @@ def handle_keno_command(chat_id, user_id, username, args):
         send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/keno &lt;amount&gt;</code>\nExample: <code>/keno 10</code>")
         return
 
-    try:
-        amount = float(args[0])
-    except ValueError:
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
         send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/keno 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
         return
 
     if amount < MIN_BET:
@@ -3327,10 +3371,12 @@ def handle_crash_command(chat_id, user_id, username, args, chat_type="private"):
         send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/crash &lt;amount&gt;</code>\nExample: <code>/crash 10</code>")
         return
 
-    try:
-        amount = float(args[0])
-    except ValueError:
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
         send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/crash 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
         return
 
     if amount < MIN_BET:
@@ -3882,10 +3928,12 @@ def handle_blackjack_command(chat_id, user_id, username, args, chat_type="privat
     if not args:
         send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/blackjack &lt;amount&gt;</code>\nExample: <code>/blackjack 10</code>")
         return
-    try:
-        amount = float(args[0])
-    except ValueError:
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
         send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/blackjack 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
         return
     if amount < MIN_BET:
         send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
@@ -4788,10 +4836,12 @@ def handle_chicken_command(chat_id, user_id, username, args, chat_type="private"
     if not args:
         send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/chickenroad &lt;amount&gt;</code>\nExample: <code>/chickenroad 10</code>")
         return
-    try:
-        amount = float(args[0])
-    except ValueError:
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
         send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/chickenroad 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
         return
     if amount < MIN_BET:
         send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
@@ -5109,10 +5159,12 @@ def handle_dice_command(chat_id, user_id, username, args, chat_type="private"):
     if not args:
         send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/dice &lt;amount&gt;</code>\nExample: <code>/dice 10</code>")
         return
-    try:
-        amount = float(args[0])
-    except ValueError:
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
         send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/dice 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
         return
     if amount < MIN_BET:
         send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
