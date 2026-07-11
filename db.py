@@ -173,6 +173,14 @@ CREATE TABLE IF NOT EXISTS payment_flow_state (
     state      JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS user_prefs (
+    user_id           BIGINT PRIMARY KEY,
+    username          TEXT,
+    display_currency  TEXT NOT NULL DEFAULT 'usd',
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_user_prefs_username ON user_prefs(username);
 """
 
 
@@ -416,6 +424,73 @@ def load_payment_flow(user_id, flow_type):
         return row["state"] if row else None
 
 
+def load_all_payment_flows():
+    """Returns [(user_id, flow_type, state_dict), ...] for every
+    in-progress /deposit or /withdraw flow, so main() can repopulate
+    pending_deposit_flow / pending_withdraw_flow after a restart instead
+    of silently dropping users mid-flow."""
+    with _cursor() as cur:
+        cur.execute("SELECT user_id, flow_type, state FROM payment_flow_state")
+        return [(row["user_id"], row["flow_type"], row["state"]) for row in cur.fetchall()]
+
+
 def clear_payment_flow(user_id):
     with _cursor() as cur:
         cur.execute("DELETE FROM payment_flow_state WHERE user_id = %s", (user_id,))
+
+
+def touch_user(user_id):
+    """Ensures a user_prefs row exists for this user_id even if they have
+    no @username and haven't touched currency prefs - so /broadcast can
+    reach everyone who's ever messaged the bot, not just depositors."""
+    with _cursor() as cur:
+        cur.execute("""
+            INSERT INTO user_prefs (user_id, updated_at)
+            VALUES (%s, now())
+            ON CONFLICT (user_id) DO NOTHING
+        """, (user_id,))
+
+
+def save_user_currency(user_id, currency):
+    with _cursor() as cur:
+        cur.execute("""
+            INSERT INTO user_prefs (user_id, display_currency, updated_at)
+            VALUES (%s, %s, now())
+            ON CONFLICT (user_id) DO UPDATE SET
+                display_currency = EXCLUDED.display_currency,
+                updated_at = now()
+        """, (user_id, currency))
+
+
+def save_username(user_id, username):
+    with _cursor() as cur:
+        cur.execute("""
+            INSERT INTO user_prefs (user_id, username, updated_at)
+            VALUES (%s, %s, now())
+            ON CONFLICT (user_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                updated_at = now()
+        """, (user_id, username))
+
+
+def load_all_user_prefs():
+    """Returns (currencies, usernames) where currencies is
+    {user_id: 'usd'/'inr'/'ltc'} and usernames is
+    {lowercased_username: user_id}, both rebuilt from the DB on startup."""
+    with _cursor() as cur:
+        cur.execute("SELECT user_id, username, display_currency FROM user_prefs")
+        rows = cur.fetchall()
+        currencies = {row["user_id"]: row["display_currency"] for row in rows if row["display_currency"]}
+        usernames = {row["username"].lower(): row["user_id"] for row in rows if row["username"]}
+        return currencies, usernames
+
+
+def load_all_user_ids():
+    """All known user_ids across wallets + prefs, for /broadcast."""
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT user_id FROM wallets
+            UNION
+            SELECT user_id FROM user_prefs
+        """)
+        return [row["user_id"] for row in cur.fetchall()]

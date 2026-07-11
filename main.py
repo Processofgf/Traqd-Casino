@@ -27,6 +27,19 @@ SESSION = requests.Session()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Comma-separated Telegram user IDs allowed to run admin-only commands
+# (e.g. /broadcast). Set this on Railway: ADMIN_IDS=123456789,987654321
+ADMIN_IDS = set()
+for _id in os.environ.get("ADMIN_IDS", "").split(","):
+    _id = _id.strip()
+    if _id.isdigit():
+        ADMIN_IDS.add(int(_id))
+
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DB_ENABLED = False  # flipped to True in main() once db.init()/migrate() succeed
 
@@ -66,6 +79,8 @@ active_keno_games = {}
 user_display_currency = {}
 CURRENCY_LOCK = threading.Lock()
 known_usernames = {}  # lowercased @username (no @) -> user_id, for /tip lookups
+all_known_user_ids = set()  # every user_id who's ever messaged the bot, for /broadcast
+KNOWN_USERS_LOCK = threading.Lock()
 SUPPORTED_CURRENCIES = {
     "usd": {"label": "USD", "emoji": "💵", "decimals": 2, "icon_id": "5409048419211682843"},
     "inr": {"label": "INR", "emoji": "🇮🇳", "decimals": 2, "icon_id": "5296467211735539812"},
@@ -219,6 +234,11 @@ def get_user_currency(user_id):
 def set_user_currency(user_id, currency):
     with CURRENCY_LOCK:
         user_display_currency[user_id] = currency
+    if DB_ENABLED:
+        try:
+            db.save_user_currency(user_id, currency)
+        except Exception as e:
+            print(f"⚠️ Could not persist currency pref for {user_id}: {e}")
 
 
 def fmt_balance(user_id, usd_amount=None):
@@ -251,6 +271,27 @@ def fmt_balance(user_id, usd_amount=None):
         value = usd_amount
 
     return f'<tg-emoji emoji-id="{meta["icon_id"]}">{meta["emoji"]}</tg-emoji> {value:.{meta["decimals"]}f} {meta["label"]}'
+
+
+def fmt_money(user_id, usd_amount):
+    """Lighter-weight sibling of fmt_balance for use inline inside game
+    result text (bet amounts, payouts, profit, balances) - just the number
+    in the user's chosen currency, no emoji/label clutter since these show
+    up many times per message. Falls back to USD if the live rate isn't
+    available, rather than showing a stale/wrong number."""
+    currency = get_user_currency(user_id)
+    if currency == "usd":
+        return f"${usd_amount:.2f}"
+
+    rates = _get_rates()
+    rate = rates.get("usd_inr") if currency == "inr" else rates.get("usd_ltc")
+    if not rate:
+        return f"${usd_amount:.2f}"
+
+    value = usd_amount * rate
+    if currency == "inr":
+        return f"₹{value:,.2f}"
+    return f"{value:.6f} LTC"
 
 
 def resolve_bet_amount(user_id, raw_text):
@@ -634,6 +675,47 @@ pending_deposit_flow = {}   # user_id -> {"coin": ...}
 pending_withdraw_flow = {}  # user_id -> {"coin": ..., "step": "amount"/"address", "amount": ...}
 FLOW_LOCK = threading.Lock()
 
+
+def _set_deposit_flow(user_id, state):
+    with FLOW_LOCK:
+        pending_deposit_flow[user_id] = state
+    if DB_ENABLED:
+        try:
+            db.save_payment_flow(user_id, "deposit", state)
+        except Exception as e:
+            print(f"⚠️ Could not persist deposit flow for {user_id}: {e}")
+
+
+def _set_withdraw_flow(user_id, state):
+    with FLOW_LOCK:
+        pending_withdraw_flow[user_id] = state
+    if DB_ENABLED:
+        try:
+            db.save_payment_flow(user_id, "withdraw", state)
+        except Exception as e:
+            print(f"⚠️ Could not persist withdraw flow for {user_id}: {e}")
+
+
+def _clear_deposit_flow(user_id):
+    with FLOW_LOCK:
+        pending_deposit_flow.pop(user_id, None)
+    if DB_ENABLED:
+        try:
+            db.clear_payment_flow(user_id)
+        except Exception as e:
+            print(f"⚠️ Could not clear persisted flow for {user_id}: {e}")
+
+
+def _clear_withdraw_flow(user_id):
+    with FLOW_LOCK:
+        pending_withdraw_flow.pop(user_id, None)
+    if DB_ENABLED:
+        try:
+            db.clear_payment_flow(user_id)
+        except Exception as e:
+            print(f"⚠️ Could not clear persisted flow for {user_id}: {e}")
+
+
 # Cached JWT for payout calls - {"token": str, "expires_at": epoch_seconds}.
 # Refreshed proactively a bit before NowPayments' 5-minute expiry so a
 # payout never fires mid-request with a stale token.
@@ -846,8 +928,7 @@ def handle_deposit_command(chat_id, user_id, username, args, chat_type="private"
         )
         return
 
-    with FLOW_LOCK:
-        pending_deposit_flow.pop(user_id, None)
+    _clear_deposit_flow(user_id)
     send_message(
         chat_id,
         f"💳 <b>Deposit</b> — {mention(user_id, username)}\n\n"
@@ -910,8 +991,7 @@ def handle_withdraw_command(chat_id, user_id, username, args, chat_type="private
         )
         return
 
-    with FLOW_LOCK:
-        pending_withdraw_flow.pop(user_id, None)
+    _clear_withdraw_flow(user_id)
 
     send_message(
         chat_id,
@@ -924,8 +1004,7 @@ def handle_withdraw_command(chat_id, user_id, username, args, chat_type="private
 
 
 def start_deposit_amount_prompt(chat_id, user_id, username, coin):
-    with FLOW_LOCK:
-        pending_deposit_flow[user_id] = {"coin": coin}
+    _set_deposit_flow(user_id, {"coin": coin})
     meta = DEPOSIT_COINS[coin]
     send_message(
         chat_id,
@@ -937,8 +1016,7 @@ def start_deposit_amount_prompt(chat_id, user_id, username, coin):
 
 def start_withdraw_amount_prompt(chat_id, user_id, username, coin):
     withdrawable = get_withdrawable_balance(user_id)
-    with FLOW_LOCK:
-        pending_withdraw_flow[user_id] = {"coin": coin, "step": "amount"}
+    _set_withdraw_flow(user_id, {"coin": coin, "step": "amount"})
     meta = DEPOSIT_COINS[coin]
     send_message(
         chat_id,
@@ -997,8 +1075,7 @@ def process_deposit_amount(chat_id, user_id, username, text):
             f"{WARN_EMOJI} Deposits are temporarily unavailable (server URL not configured). "
             "Please try again shortly or contact support."
         )
-        with FLOW_LOCK:
-            pending_deposit_flow.pop(user_id, None)
+        _clear_deposit_flow(user_id)
         return True
 
     try:
@@ -1030,8 +1107,7 @@ def process_deposit_amount(chat_id, user_id, username, text):
     if status not in (200, 201) or "payment_id" not in resp:
         send_message(chat_id, f"{WARN_EMOJI} Couldn't create the deposit invoice right now. Please try again shortly.")
         print(f"NowPayments create-payment failed: status={status} resp={resp}")
-        with FLOW_LOCK:
-            pending_deposit_flow.pop(user_id, None)
+        _clear_deposit_flow(user_id)
         return True
 
     payment_id = str(resp["payment_id"])
@@ -1048,8 +1124,7 @@ def process_deposit_amount(chat_id, user_id, username, text):
             "created_at": time.time(),
         }
 
-    with FLOW_LOCK:
-        pending_deposit_flow.pop(user_id, None)
+    _clear_deposit_flow(user_id)
 
     send_message(
         chat_id,
@@ -1082,8 +1157,7 @@ def process_withdraw_amount(chat_id, user_id, username, text):
         send_message(chat_id, f"{WARN_EMOJI} You only have ${withdrawable:.2f} withdrawable right now.")
         return True
 
-    with FLOW_LOCK:
-        pending_withdraw_flow[user_id] = {"coin": flow["coin"], "step": "address", "amount": usd_amount}
+    _set_withdraw_flow(user_id, {"coin": flow["coin"], "step": "address", "amount": usd_amount})
 
     meta = DEPOSIT_COINS[flow["coin"]]
     send_message(
@@ -1170,8 +1244,7 @@ def process_withdraw_address(chat_id, user_id, username, text):
     withdrawable = get_withdrawable_balance(user_id)
     if usd_amount > withdrawable:
         send_message(chat_id, f"{WARN_EMOJI} Your withdrawable balance changed and is now only ${withdrawable:.2f}. Start over with /withdraw.")
-        with FLOW_LOCK:
-            pending_withdraw_flow.pop(user_id, None)
+        _clear_withdraw_flow(user_id)
         return True
 
     # Deduct immediately so the same funds can't be withdrawn twice while
@@ -1191,8 +1264,7 @@ def process_withdraw_address(chat_id, user_id, username, text):
             "created_at": time.time(),
         }
 
-    with FLOW_LOCK:
-        pending_withdraw_flow.pop(user_id, None)
+    _clear_withdraw_flow(user_id)
 
     ok, stage, detail = _now_create_and_verify_payout(address, coin, usd_amount)
 
@@ -1724,21 +1796,21 @@ def handle_roulette_command(chat_id, user_id, username, args):
         return
 
     if amount < MIN_BET:
-        send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
+        send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
         return
     if amount > MAX_BET:
-        send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Maximum bet is ${MAX_BET:.2f}")
+        send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
         return
 
     balance = get_balance(user_id)
     if amount > balance:
-        send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Insufficient balance. Your balance: ${balance:.2f}")
+        send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
         return
 
     caption = (
         f"{ROULETTE_HEADER_EMOJI} <b>Roulette</b> — 🎡 {mention(user_id, username)}\n\n"
-        f"Bet: <b>${amount:.2f}</b>\n"
-        f"Balance: <b>${balance:.2f}</b>\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n"
+        f"Balance: <b>{fmt_money(user_id, balance)}</b>\n\n"
         f"Place your bet:"
     )
 
@@ -1825,7 +1897,7 @@ def handle_callback(callback_query):
         balance = get_balance(owner_id)
         if amount > balance:
             answer_callback(callback_id, "Insufficient balance!")
-            edit_message(chat_id, message_id, f"{WARN_EMOJI} Insufficient balance. Your balance: ${balance:.2f}")
+            edit_message(chat_id, message_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(owner_id, balance)}")
             return
 
         answer_callback(callback_id)
@@ -1852,7 +1924,7 @@ def handle_callback(callback_query):
         edit_message(
             chat_id, message_id,
             f"{MINES_FRESH_BOARD_EMOJI} <b>Mines</b> — {mention(owner_id, username)}\n\n"
-            f"Bet: <b>${amount:.2f}</b> · Mines: <b>{bomb_count}</b>\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Mines: <b>{bomb_count}</b>\n"
             f"Multiplier: <b>1.00x</b>\n\n"
             f"Pick a tile:",
             reply_markup=mines_grid_keyboard(owner_id, set(), bomb_count, 1.00)
@@ -1893,10 +1965,10 @@ def handle_callback(callback_query):
             edit_message(
                 chat_id, message_id,
                 f"{MINES_BOOM_LOSS_EMOJI} <b>BOOM! You hit a mine!</b>\n\n"
-                f"Bet: <b>${amount:.2f}</b> · Mines: <b>{bomb_count}</b>\n"
+                f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Mines: <b>{bomb_count}</b>\n"
                 f"Safe tiles found: <b>{revealed_count}</b>\n\n"
-                f"{cemoji('money')} You lost <b>${amount:.2f}</b>\n"
-                f"{cemoji('money')} Balance: <b>${new_balance:.2f}</b>",
+                f"{cemoji('money')} You lost <b>{fmt_money(owner_id, amount)}</b>\n"
+                f"{cemoji('money')} Balance: <b>{fmt_money(owner_id, new_balance)}</b>",
                 reply_markup=mines_grid_keyboard(
                     owner_id, game["revealed"], bomb_count, 0,
                     mine_positions=mine_positions, hit_index=idx,
@@ -1923,12 +1995,12 @@ def handle_callback(callback_query):
             edit_message(
                 chat_id, message_id,
                 f"{cemoji('trophy')} <b>Board cleared!</b>\n\n"
-                f"Bet: <b>${amount:.2f}</b> · Mines: <b>{bomb_count}</b>\n"
+                f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Mines: <b>{bomb_count}</b>\n"
                 f"Safe tiles found: <b>{revealed_count}</b> (all of them!)\n"
                 f"You found every safe tile — cashed out automatically.\n\n"
-                f"{PAYOUT_EMOJI} Payout: <b>${payout:.2f}</b> ({multiplier:g}x)\n"
-                f"{cemoji('fire')} Profit: <b>+${profit:.2f}</b>\n"
-                f"{cemoji('money')} Balance: <b>${new_balance:.2f}</b>",
+                f"{PAYOUT_EMOJI} Payout: <b>{fmt_money(owner_id, payout)}</b> ({multiplier:g}x)\n"
+                f"{cemoji('fire')} Profit: <b>+{fmt_money(owner_id, profit)}</b>\n"
+                f"{cemoji('money')} Balance: <b>{fmt_money(owner_id, new_balance)}</b>",
                 reply_markup=mines_grid_keyboard(
                     owner_id, game["revealed"], bomb_count, multiplier,
                     mine_positions=mine_positions, game_over=True, server_seed=server_seed,
@@ -1940,7 +2012,7 @@ def handle_callback(callback_query):
         edit_message(
             chat_id, message_id,
             f"{MINES_BOMBSELECT_EMOJI} <b>Mines</b> — {mention(owner_id, username)}\n\n"
-            f"Bet: <b>${amount:.2f}</b> · Mines: <b>{bomb_count}</b>\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Mines: <b>{bomb_count}</b>\n"
             f"Multiplier: <b>{multiplier:g}x</b>\n\n"
             f"Pick a tile or cash out:",
             reply_markup=mines_grid_keyboard(owner_id, game["revealed"], bomb_count, multiplier)
@@ -1984,11 +2056,11 @@ def handle_callback(callback_query):
         edit_message(
             chat_id, message_id,
             f"{cemoji('trophy')} <b>Cashed out!</b>\n\n"
-            f"Bet: <b>${amount:.2f}</b> · Mines: <b>{bomb_count}</b>\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Mines: <b>{bomb_count}</b>\n"
             f"Safe tiles found: <b>{revealed_count}</b>\n\n"
-            f"{PAYOUT_EMOJI} Payout: <b>${payout:.2f}</b> ({multiplier:g}x)\n"
-            f"{cemoji('fire')} Profit: <b>+${profit:.2f}</b>\n"
-            f"{cemoji('money')} Balance: <b>${new_balance:.2f}</b>",
+            f"{PAYOUT_EMOJI} Payout: <b>{fmt_money(owner_id, payout)}</b> ({multiplier:g}x)\n"
+            f"{cemoji('fire')} Profit: <b>+{fmt_money(owner_id, profit)}</b>\n"
+            f"{cemoji('money')} Balance: <b>{fmt_money(owner_id, new_balance)}</b>",
             reply_markup=mines_grid_keyboard(
                 owner_id, game["revealed"], bomb_count, multiplier,
                 mine_positions=mine_positions, game_over=True, server_seed=server_seed,
@@ -2013,7 +2085,7 @@ def handle_callback(callback_query):
         balance = get_balance(owner_id)
         if amount > balance:
             answer_callback(callback_id, "Insufficient balance!")
-            edit_message(chat_id, message_id, f"{WARN_EMOJI} Insufficient balance. Your balance: ${balance:.2f}")
+            edit_message(chat_id, message_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(owner_id, balance)}")
             return
 
         config = TOWERS_DIFFICULTY[difficulty]
@@ -2050,7 +2122,7 @@ def handle_callback(callback_query):
         edit_message(
             chat_id, message_id,
             f"{TOWERS_HEADER_EMOJI} <b>Towers</b> — {mention(owner_id, username)}\n\n"
-            f"Bet: <b>${amount:.2f}</b> · Difficulty: <b>{label}</b>\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Difficulty: <b>{label}</b>\n"
             f"Row: <b>1 / {TOWERS_ROWS}</b> · Multiplier: <b>1.00x</b>\n\n"
             f"Pick a tile:",
             reply_markup=towers_grid_keyboard(owner_id, game)
@@ -2092,10 +2164,10 @@ def handle_callback(callback_query):
             edit_message(
                 chat_id, message_id,
                 f"{TOWERS_SNAKE_LOSS_EMOJI} <b>You hit a snake!</b>\n\n"
-                f"Bet: <b>${amount:.2f}</b> · Difficulty: <b>{label}</b>\n"
+                f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Difficulty: <b>{label}</b>\n"
                 f"Rows climbed: <b>{rows_cleared} / {TOWERS_ROWS}</b>\n\n"
-                f"{TOWERS_LOST_MONEY_EMOJI} You lost <b>${amount:.2f}</b>\n"
-                f"{cemoji('money')} Balance: <b>${new_balance:.2f}</b>",
+                f"{TOWERS_LOST_MONEY_EMOJI} You lost <b>{fmt_money(owner_id, amount)}</b>\n"
+                f"{cemoji('money')} Balance: <b>{fmt_money(owner_id, new_balance)}</b>",
                 reply_markup=towers_grid_keyboard(owner_id, game, game_over=True)
             )
             return
@@ -2119,11 +2191,11 @@ def handle_callback(callback_query):
             edit_message(
                 chat_id, message_id,
                 f"{cemoji('trophy')} <b>Tower conquered!</b>\n\n"
-                f"Bet: <b>${amount:.2f}</b> · Difficulty: <b>{label}</b>\n"
+                f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Difficulty: <b>{label}</b>\n"
                 f"Rows climbed: <b>{rows_cleared} / {TOWERS_ROWS}</b> (all of them!)\n\n"
-                f"{PAYOUT_EMOJI} Payout: <b>${payout:.2f}</b> ({multiplier:g}x)\n"
-                f"{cemoji('fire')} Profit: <b>+${profit:.2f}</b>\n"
-                f"{cemoji('money')} Balance: <b>${new_balance:.2f}</b>",
+                f"{PAYOUT_EMOJI} Payout: <b>{fmt_money(owner_id, payout)}</b> ({multiplier:g}x)\n"
+                f"{cemoji('fire')} Profit: <b>+{fmt_money(owner_id, profit)}</b>\n"
+                f"{cemoji('money')} Balance: <b>{fmt_money(owner_id, new_balance)}</b>",
                 reply_markup=towers_grid_keyboard(owner_id, game, game_over=True)
             )
             return
@@ -2132,7 +2204,7 @@ def handle_callback(callback_query):
         edit_message(
             chat_id, message_id,
             f"{TOWERS_HEADER_EMOJI} <b>Towers</b> — {mention(owner_id, username)}\n\n"
-            f"Bet: <b>${amount:.2f}</b> · Difficulty: <b>{label}</b>\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Difficulty: <b>{label}</b>\n"
             f"Row: <b>{game['current_row']} / {TOWERS_ROWS}</b> · Multiplier: <b>{multiplier:g}x</b>\n\n"
             f"Pick a tile or cash out:",
             reply_markup=towers_grid_keyboard(owner_id, game)
@@ -2173,11 +2245,11 @@ def handle_callback(callback_query):
         edit_message(
             chat_id, message_id,
             f"{cemoji('trophy')} <b>Cashed out!</b>\n\n"
-            f"Bet: <b>${amount:.2f}</b> · Difficulty: <b>{label}</b>\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Difficulty: <b>{label}</b>\n"
             f"Rows climbed: <b>{rows_cleared} / {TOWERS_ROWS}</b>\n\n"
-            f"{PAYOUT_EMOJI} Payout: <b>${payout:.2f}</b> ({multiplier:g}x)\n"
-            f"{cemoji('fire')} Profit: <b>+${profit:.2f}</b>\n"
-            f"{cemoji('money')} Balance: <b>${new_balance:.2f}</b>",
+            f"{PAYOUT_EMOJI} Payout: <b>{fmt_money(owner_id, payout)}</b> ({multiplier:g}x)\n"
+            f"{cemoji('fire')} Profit: <b>+{fmt_money(owner_id, profit)}</b>\n"
+            f"{cemoji('money')} Balance: <b>{fmt_money(owner_id, new_balance)}</b>",
             reply_markup=towers_grid_keyboard(owner_id, game, game_over=True)
         )
         return
@@ -2202,7 +2274,7 @@ def handle_callback(callback_query):
         edit_message(
             chat_id, message_id,
             f"{KENO_EMOJI} <b>Keno</b> — {mention(owner_id, username)}\n\n"
-            f"Bet: <b>${game['amount']:.2f}</b> · Risk: <b>{risk_label}</b>\n\n"
+            f"Bet: <b>{fmt_money(owner_id, game['amount'])}</b> · Risk: <b>{risk_label}</b>\n\n"
             f"Pick 1-10 numbers (1-40), then Confirm:",
             reply_markup=keno_select_keyboard(owner_id, game["selected"])
         )
@@ -2236,7 +2308,7 @@ def handle_callback(callback_query):
         edit_message(
             chat_id, message_id,
             f"{KENO_EMOJI} <b>Keno</b> — {mention(owner_id, username)}\n\n"
-            f"Bet: <b>${game['amount']:.2f}</b> · Risk: <b>{risk_label}</b>\n\n"
+            f"Bet: <b>{fmt_money(owner_id, game['amount'])}</b> · Risk: <b>{risk_label}</b>\n\n"
             f"Pick 1-10 numbers (1-40), then Confirm:",
             reply_markup=keno_select_keyboard(owner_id, selected)
         )
@@ -2261,7 +2333,7 @@ def handle_callback(callback_query):
         edit_message(
             chat_id, message_id,
             f"{KENO_EMOJI} <b>Keno</b> — {mention(owner_id, username)}\n\n"
-            f"Bet: <b>${game['amount']:.2f}</b> · Risk: <b>{risk_label}</b>\n\n"
+            f"Bet: <b>{fmt_money(owner_id, game['amount'])}</b> · Risk: <b>{risk_label}</b>\n\n"
             f"Pick 1-10 numbers (1-40), then Confirm:",
             reply_markup=keno_select_keyboard(owner_id, game["selected"])
         )
@@ -2291,7 +2363,7 @@ def handle_callback(callback_query):
         balance = get_balance(owner_id)
         if amount > balance:
             answer_callback(callback_id, "Insufficient balance!")
-            edit_message(chat_id, message_id, f"{WARN_EMOJI} Insufficient balance. Your balance: ${balance:.2f}")
+            edit_message(chat_id, message_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(owner_id, balance)}")
             with KENO_LOCK:
                 active_keno_games.pop(owner_id, None)
             return
@@ -2330,15 +2402,15 @@ def handle_callback(callback_query):
         result_text = (
             f"{KENO_EMOJI} <b>Keno</b> — {header}\n"
             f"{mention(owner_id, username)}\n\n"
-            f"Bet: <b>${amount:.2f}</b> · Risk: <b>{risk_label}</b> · Picks: <b>{picks}</b>\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> · Risk: <b>{risk_label}</b> · Picks: <b>{picks}</b>\n"
             f"Hits: <b>{hits} / {picks}</b>\n\n"
-            f"{cemoji('money')} Payout: <b>${payout:.2f}</b> ({multiplier:g}x)\n"
+            f"{cemoji('money')} Payout: <b>{fmt_money(owner_id, payout)}</b> ({multiplier:g}x)\n"
         )
         if profit >= 0:
-            result_text += f"{cemoji('fire')} Profit: <b>+${profit:.2f}</b>\n"
+            result_text += f"{cemoji('fire')} Profit: <b>+{fmt_money(owner_id, profit)}</b>\n"
         else:
-            result_text += f"{cemoji('money')} Loss: <b>${abs(profit):.2f}</b>\n"
-        result_text += f"{cemoji('money')} Balance: <b>${new_balance:.2f}</b>"
+            result_text += f"{cemoji('money')} Loss: <b>{fmt_money(owner_id, abs(profit))}</b>\n"
+        result_text += f"{cemoji('money')} Balance: <b>{fmt_money(owner_id, new_balance)}</b>"
 
         edit_message(
             chat_id, message_id, result_text,
@@ -2369,7 +2441,7 @@ def handle_callback(callback_query):
             edit_message_caption(
                 chat_id, message_id,
                 f"{ROULETTE_HEADER_EMOJI} <b>Roulette</b> — 🎡 {mention(owner_id, username)}\n\n"
-                f"Bet: <b>${amount:.2f}</b>\n\n"
+                f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n\n"
                 f"🔢 Pick a number (0-36):",
                 reply_markup=roulette_number_grid_keyboard(amount, owner_id)
             )
@@ -2382,8 +2454,8 @@ def handle_callback(callback_query):
             chat_id, message_id,
             f"{ROULETTE_HEADER_EMOJI} <b>Roulette</b> — 🎡 {mention(owner_id, username)}\n\n"
             f"Bet: <b>{label}</b>\n"
-            f"Amount: <b>${amount:.2f}</b>\n"
-            f"Payout if win: <b>${amount * payout_mult:.2f}</b> ({payout_mult:g}x)\n\n"
+            f"Amount: <b>{fmt_money(owner_id, amount)}</b>\n"
+            f"Payout if win: <b>{fmt_money(owner_id, amount * payout_mult)}</b> ({payout_mult:g}x)\n\n"
             f"Confirm your bet?",
             reply_markup=confirm_keyboard(bet_type, bet_type, amount, owner_id)
         )
@@ -2405,8 +2477,8 @@ def handle_callback(callback_query):
             chat_id, message_id,
             f"{ROULETTE_HEADER_EMOJI} <b>Roulette</b> — 🎡 {mention(owner_id, username)}\n\n"
             f"Bet: <b>{num_colour_emoji} Number {number}</b>\n"
-            f"Amount: <b>${amount:.2f}</b>\n"
-            f"Payout if win: <b>${amount * payout_mult:.2f}</b> ({payout_mult:g}x)\n\n"
+            f"Amount: <b>{fmt_money(owner_id, amount)}</b>\n"
+            f"Payout if win: <b>{fmt_money(owner_id, amount * payout_mult)}</b> ({payout_mult:g}x)\n\n"
             f"Confirm your bet?",
             reply_markup=confirm_keyboard("number", number, amount, owner_id)
         )
@@ -2423,8 +2495,8 @@ def handle_callback(callback_query):
         edit_message_caption(
             chat_id, message_id,
             f"{ROULETTE_HEADER_EMOJI} <b>Roulette</b> — 🎡 {mention(owner_id, username)}\n\n"
-            f"Bet: <b>${amount:.2f}</b>\n"
-            f"Balance: <b>${balance:.2f}</b>\n\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n"
+            f"Balance: <b>{fmt_money(owner_id, balance)}</b>\n\n"
             f"Place your bet:",
             reply_markup=roulette_main_keyboard(amount, owner_id)
         )
@@ -2443,7 +2515,7 @@ def handle_callback(callback_query):
         balance = get_balance(owner_id)
         if amount > balance:
             answer_callback(callback_id, "Insufficient balance!")
-            edit_message_caption(chat_id, message_id, f"{ROULETTE_WARN_EMOJI} Insufficient balance. Your balance: ${balance:.2f}")
+            edit_message_caption(chat_id, message_id, f"{ROULETTE_WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(owner_id, balance)}")
             return
 
         answer_callback(callback_id, "🎲 Spinning...")
@@ -2485,15 +2557,15 @@ def handle_callback(callback_query):
             result_text = (
                 f"{roulette_win_emoji} It landed on <b>{result_number}</b> {colour_emoji} — "
                 f"{mention(owner_id, username)} wins {roulette_wins_emoji}\n"
-                f"Your {bet_display} bet paid <b>${payout:.2f}</b>\n"
-                f"{roulette_balance_emoji} Balance: <b>${new_balance:.2f}</b>"
+                f"Your {bet_display} bet paid <b>{fmt_money(owner_id, payout)}</b>\n"
+                f"{roulette_balance_emoji} Balance: <b>{fmt_money(owner_id, new_balance)}</b>"
             )
         else:
             result_text = (
                 f"It landed on <b>{result_number}</b> {colour_emoji} — "
                 f"{mention(owner_id, username)}, no luck this time\n"
-                f"Your {bet_display} bet lost <b>${amount:.2f}</b>\n"
-                f"{roulette_balance_emoji} Balance: <b>${new_balance:.2f}</b>"
+                f"Your {bet_display} bet lost <b>{fmt_money(owner_id, amount)}</b>\n"
+                f"{roulette_balance_emoji} Balance: <b>{fmt_money(owner_id, new_balance)}</b>"
             )
 
         send_message(chat_id, result_text, reply_markup=fair_button_keyboard("r", server_seed, client_seed, nonce))
@@ -2566,10 +2638,10 @@ def handle_limbo_command(chat_id, user_id, username, args):
         return
 
     if amount < MIN_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
         return
     if amount > MAX_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is ${MAX_BET:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
         return
     if target < LIMBO_MIN_TARGET:
         send_message(chat_id, f"{WARN_EMOJI} Minimum target is {LIMBO_MIN_TARGET:.2f}x")
@@ -2580,7 +2652,7 @@ def handle_limbo_command(chat_id, user_id, username, args):
 
     balance = get_balance(user_id)
     if amount > balance:
-        send_message(chat_id, f'{WARN_EMOJI} Insufficient balance. Your balance: ${balance:.2f}')
+        send_message(chat_id, f'{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}')
         return
 
     adjust_balance(user_id, -amount)
@@ -2600,18 +2672,18 @@ def handle_limbo_command(chat_id, user_id, username, args):
     if win:
         result_text = (
             f'<tg-emoji emoji-id="5244837092042750681">🎯</tg-emoji> <b>Limbo</b> \u2014 {mention(user_id, username)}\n\n'
-            f"${amount:.2f} \u2192 ${potential_payout:.2f} ({target:g}x)\n"
+            f"{fmt_money(user_id, amount)} \u2192 {fmt_money(user_id, potential_payout)} ({target:g}x)\n"
             f'Rolled: <b>{result_multiplier:.2f}x</b> <tg-emoji emoji-id="5206607081334906820">✅</tg-emoji>\n\n'
-            f'<tg-emoji emoji-id="6082586710988820084">🏆</tg-emoji> You won <b>${payout:.2f}</b>!\n'
-            f'<tg-emoji emoji-id="5224257782013769471">💰</tg-emoji> Balance: <b>${new_balance:.2f}</b>'
+            f'<tg-emoji emoji-id="6082586710988820084">🏆</tg-emoji> You won <b>{fmt_money(user_id, payout)}</b>!\n'
+            f'<tg-emoji emoji-id="5224257782013769471">💰</tg-emoji> Balance: <b>{fmt_money(user_id, new_balance)}</b>'
         )
     else:
         result_text = (
             f'<tg-emoji emoji-id="5244837092042750681">🎯</tg-emoji> <b>Limbo</b> \u2014 {mention(user_id, username)}\n\n'
-            f"${amount:.2f} \u2192 ${potential_payout:.2f} ({target:g}x)\n"
+            f"{fmt_money(user_id, amount)} \u2192 {fmt_money(user_id, potential_payout)} ({target:g}x)\n"
             f'Rolled: <b>{result_multiplier:.2f}x</b> <tg-emoji emoji-id="5210952531676504517">❌</tg-emoji>\n\n'
-            f"No luck this time. Lost <b>${amount:.2f}</b>\n"
-            f'<tg-emoji emoji-id="5224257782013769471">💰</tg-emoji> Balance: <b>${new_balance:.2f}</b>'
+            f"No luck this time. Lost <b>{fmt_money(user_id, amount)}</b>\n"
+            f'<tg-emoji emoji-id="5224257782013769471">💰</tg-emoji> Balance: <b>{fmt_money(user_id, new_balance)}</b>'
         )
 
     send_message(chat_id, result_text, reply_markup=fair_button_keyboard("l", server_seed, client_seed, nonce))
@@ -2673,10 +2745,10 @@ def handle_coinflip_command(chat_id, user_id, username, args):
         return
 
     if amount < MIN_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
         return
     if amount > MAX_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is ${MAX_BET:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
         return
 
     with COINFLIP_LOCK:
@@ -2685,7 +2757,7 @@ def handle_coinflip_command(chat_id, user_id, username, args):
             return
         balance = get_balance(user_id)
         if amount > balance:
-            send_message(chat_id, f'{WARN_EMOJI} Insufficient balance. Your balance: ${balance:.2f}')
+            send_message(chat_id, f'{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}')
             return
         # Deducting and marking this user "busy" inside the same lock as the
         # balance check above is the actual fix here - spamming /coinflip
@@ -2715,16 +2787,16 @@ def handle_coinflip_command(chat_id, user_id, username, args):
             result_text = (
                 f"{cemoji('chip')} <b>Coinflip</b> — {mention(user_id, username)}\n\n"
                 f"You called <b>{guess}</b>, landed <b>{result}</b>\n"
-                f"${amount:.2f} \u2192 ${potential_payout:.2f} ({COINFLIP_PAYOUT:g}x)\n\n"
-                f"{cemoji('trophy')} You won <b>${payout:.2f}</b>!\n"
-                f"{cemoji('money')} Balance: <b>${new_balance:.2f}</b>"
+                f"{fmt_money(user_id, amount)} \u2192 {fmt_money(user_id, potential_payout)} ({COINFLIP_PAYOUT:g}x)\n\n"
+                f"{cemoji('trophy')} You won <b>{fmt_money(user_id, payout)}</b>!\n"
+                f"{cemoji('money')} Balance: <b>{fmt_money(user_id, new_balance)}</b>"
             )
         else:
             result_text = (
                 f"{cemoji('chip')} <b>Coinflip</b> — {mention(user_id, username)}\n\n"
                 f"You called <b>{guess}</b>, landed <b>{result}</b>\n"
-                f"No luck this time. Lost <b>${amount:.2f}</b>\n"
-                f"{cemoji('money')} Balance: <b>${new_balance:.2f}</b>"
+                f"No luck this time. Lost <b>{fmt_money(user_id, amount)}</b>\n"
+                f"{cemoji('money')} Balance: <b>{fmt_money(user_id, new_balance)}</b>"
             )
 
         send_message(chat_id, result_text, reply_markup=fair_button_keyboard("cf", server_seed, client_seed, nonce))
@@ -2827,15 +2899,15 @@ def handle_mines_command(chat_id, user_id, username, args):
         return
 
     if amount < MIN_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
         return
     if amount > MAX_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is ${MAX_BET:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
         return
 
     balance = get_balance(user_id)
     if amount > balance:
-        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: ${balance:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
         return
 
     if user_id in active_mines_games:
@@ -2845,7 +2917,7 @@ def handle_mines_command(chat_id, user_id, username, args):
     send_message(
         chat_id,
         f"{MINES_BOMBSELECT_EMOJI} <b>Mines</b> — {mention(user_id, username)}\n\n"
-        f"Bet: <b>${amount:.2f}</b>\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
         f"How many mines do you want on the board?",
         reply_markup=mines_bomb_count_keyboard(amount, user_id)
     )
@@ -2978,15 +3050,15 @@ def handle_towers_command(chat_id, user_id, username, args):
         return
 
     if amount < MIN_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
         return
     if amount > MAX_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is ${MAX_BET:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
         return
 
     balance = get_balance(user_id)
     if amount > balance:
-        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: ${balance:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
         return
 
     if user_id in active_towers_games:
@@ -2996,7 +3068,7 @@ def handle_towers_command(chat_id, user_id, username, args):
     send_message(
         chat_id,
         f"{TOWERS_HEADER_EMOJI} <b>Towers</b> — {mention(user_id, username)}\n\n"
-        f"Bet: <b>${amount:.2f}</b>\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
         f"Pick a difficulty:",
         reply_markup=towers_difficulty_keyboard(amount, user_id)
     )
@@ -3144,15 +3216,15 @@ def handle_keno_command(chat_id, user_id, username, args):
         return
 
     if amount < MIN_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
         return
     if amount > MAX_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is ${MAX_BET:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
         return
 
     balance = get_balance(user_id)
     if amount > balance:
-        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: ${balance:.2f}")
+        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
         return
 
     if user_id in active_keno_games:
@@ -3165,7 +3237,7 @@ def handle_keno_command(chat_id, user_id, username, args):
     send_message(
         chat_id,
         f"{KENO_EMOJI} <b>Keno</b> — {mention(user_id, username)}\n\n"
-        f"Bet: <b>${amount:.2f}</b>\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
         f"Choose a risk level:",
         reply_markup=keno_risk_keyboard(user_id)
     )
@@ -3226,8 +3298,8 @@ def crash_finalize(token):
             game["chat_id"],
             f"{CRASH_BOOM_EMOJI} <b>Crash</b> — {mention(game['user_id'], game['username'])}\n\n"
             f"The rocket blew up at <b>{game['crash_point']:.2f}x</b>!\n"
-            f"You didn't cash out in time. Lost <b>${game['amount']:.2f}</b>\n"
-            f"{cemoji('money')} Balance: <b>${get_balance(game['user_id']):.2f}</b>",
+            f"You didn't cash out in time. Lost <b>{fmt_money(game['user_id'], game['amount'])}</b>\n"
+            f"{cemoji('money')} Balance: <b>{fmt_money(game['user_id'], get_balance(game['user_id']))}</b>",
             reply_markup=fair_button_keyboard("c", game["server_seed"], game["client_seed"], game["nonce"])
         )
 
@@ -3341,9 +3413,9 @@ def crash_attempt_cashout(token):
         chat_id,
         f"{CRASH_ROCKET_EMOJI} <b>Crash</b> — {mention(user_id, username)}\n\n"
         f"Cashed out at <b>{current:.2f}x</b>!\n"
-        f"${amount:.2f} \u2192 ${payout:.2f}\n\n"
-        f"{cemoji('trophy')} You won <b>${payout - amount:.2f}</b>!\n"
-        f"{cemoji('money')} Balance: <b>${get_balance(user_id):.2f}</b>",
+        f"{fmt_money(user_id, amount)} \u2192 {fmt_money(user_id, payout)}\n\n"
+        f"{cemoji('trophy')} You won <b>{fmt_money(user_id, payout - amount)}</b>!\n"
+        f"{cemoji('money')} Balance: <b>{fmt_money(user_id, get_balance(user_id))}</b>",
         reply_markup=fair_button_keyboard("c", game["server_seed"], game["client_seed"], game["nonce"])
     )
     return {"ok": True, "multiplier": current, "payout": payout}
@@ -4020,7 +4092,23 @@ def handle_message(message):
 
     uname = message["from"].get("username")
     if uname:
-        known_usernames[uname.lower()] = user_id
+        key = uname.lower()
+        if known_usernames.get(key) != user_id:
+            known_usernames[key] = user_id
+            if DB_ENABLED:
+                try:
+                    db.save_username(user_id, key)
+                except Exception as e:
+                    print(f"⚠️ Could not persist username for {user_id}: {e}")
+
+    if user_id not in all_known_user_ids:
+        with KNOWN_USERS_LOCK:
+            all_known_user_ids.add(user_id)
+        if DB_ENABLED:
+            try:
+                db.touch_user(user_id)
+            except Exception as e:
+                print(f"⚠️ Could not record user {user_id}: {e}")
 
     if check_for_custom_emoji_ids(message):
         return
@@ -4398,6 +4486,33 @@ def handle_message(message):
             chat_id,
             f"🎁 {mention(user_id, name)} tipped {mention(recipient_id, recipient_name)} <b>${amount:.2f}</b>!{note}"
         )
+        return
+
+    if command == "/broadcast":
+        # Admin-only, deliberately NOT listed in /help or the command menu.
+        if not is_admin(user_id):
+            return
+        parts0 = text.split(None, 1)
+        if len(parts0) < 2 or not parts0[1].strip():
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/broadcast Your message here</code>\nHTML formatting (&lt;b&gt;, &lt;i&gt;, etc.) is supported.")
+            return
+        broadcast_text = parts0[1].strip()
+        recipients = list(all_known_user_ids)
+        send_message(chat_id, f"📣 Broadcasting to {len(recipients)} user(s)...")
+
+        def _run_broadcast():
+            sent, failed = 0, 0
+            for uid in recipients:
+                try:
+                    send_message(uid, broadcast_text)
+                    sent += 1
+                except Exception as e:
+                    failed += 1
+                    print(f"⚠️ Broadcast failed for {uid}: {e}")
+                time.sleep(0.05)  # ~20 msg/sec, safely under Telegram's global rate limit
+            send_message(chat_id, f"✅ Broadcast complete. Sent: {sent}, Failed: {failed}.")
+
+        threading.Thread(target=_run_broadcast, daemon=True).start()
         return
 
     if command == "/seed":
@@ -5296,6 +5411,32 @@ def restore_state_from_db():
         print(f"💾 Restored {len(seeds)} fairness seed(s) from DB.")
     except Exception as e:
         print(f"⚠️ Failed to restore fairness seeds: {e}")
+
+    try:
+        flows = db.load_all_payment_flows()
+        for uid, flow_type, state in flows:
+            if flow_type == "deposit":
+                pending_deposit_flow[uid] = state
+            elif flow_type == "withdraw":
+                pending_withdraw_flow[uid] = state
+        print(f"💾 Restored {len(flows)} in-progress deposit/withdraw flow(s) from DB.")
+    except Exception as e:
+        print(f"⚠️ Failed to restore payment flows: {e}")
+
+    try:
+        currencies, usernames = db.load_all_user_prefs()
+        user_display_currency.update(currencies)
+        known_usernames.update(usernames)
+        print(f"💾 Restored {len(currencies)} currency pref(s) and {len(usernames)} username(s) from DB.")
+    except Exception as e:
+        print(f"⚠️ Failed to restore user prefs: {e}")
+
+    try:
+        all_ids = db.load_all_user_ids()
+        all_known_user_ids.update(all_ids)
+        print(f"💾 Restored {len(all_ids)} known user(s) for /broadcast.")
+    except Exception as e:
+        print(f"⚠️ Failed to restore known users: {e}")
 
     try:
         deposits_loaded = db.load_all_pending_deposits()
