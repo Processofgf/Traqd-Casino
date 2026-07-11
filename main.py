@@ -872,7 +872,7 @@ def process_deposit_amount(chat_id, user_id, username, text):
         "ipn_callback_url": f"{APP_URL}/api/nowpayments/ipn" if APP_URL else None,
     })
 
-    if status != 200 or "payment_id" not in resp:
+    if status not in (200, 201) or "payment_id" not in resp:
         send_message(chat_id, f"{WARN_EMOJI} Couldn't create the deposit invoice right now. Please try again shortly.")
         print(f"NowPayments create-payment failed: status={status} resp={resp}")
         with FLOW_LOCK:
