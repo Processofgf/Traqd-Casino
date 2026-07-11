@@ -5,6 +5,7 @@ in-memory write-through cache for speed.
 """
 
 import requests
+import json
 import time
 import os
 import random
@@ -5095,6 +5096,34 @@ def main():
             time.sleep(60)
 
     print("🎰 Traqd Casino running...")
+
+    try:
+        commands = [
+            {"command": "start", "description": "Welcome & quick intro"},
+            {"command": "deposit", "description": "Fund your account (crypto)"},
+            {"command": "withdraw", "description": "Withdraw your balance"},
+            {"command": "balance", "description": "Check your balance"},
+            {"command": "blackjack", "description": "Play Blackjack"},
+            {"command": "dice", "description": "Play Dice"},
+            {"command": "crash", "description": "Play Crash"},
+            {"command": "chickenroad", "description": "Play Chicken Road"},
+            {"command": "roulette", "description": "Play Roulette"},
+            {"command": "coinflip", "description": "Play Coinflip"},
+            {"command": "towers", "description": "Play Towers"},
+            {"command": "mines", "description": "Play Mines"},
+            {"command": "keno", "description": "Play Keno"},
+            {"command": "limbo", "description": "Play Limbo"},
+            {"command": "seed", "description": "View your provably-fair seed"},
+            {"command": "newseed", "description": "Rotate your provably-fair seed"},
+            {"command": "help", "description": "Every game & command"},
+        ]
+        result = api_call("setMyCommands", commands=json.dumps(commands))
+        if result.get("ok"):
+            print("✅ Bot command menu registered with Telegram.")
+        else:
+            print(f"⚠️  setMyCommands returned: {result}")
+    except Exception as e:
+        print(f"⚠️  Could not register command menu: {e}")
 
     if NOWPAYMENTS_API_KEY:
         missing = [
