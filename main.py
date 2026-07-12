@@ -238,6 +238,16 @@ FAIR_LOCK = threading.Lock()
 wallets = {}   # user_id -> {"real", "bonus", "wager_required", "wager_progress", "deposit_wager_required", "deposit_wager_progress", "has_deposited"}
 WALLET_LOCK = threading.Lock()
 
+# Write-behind persistence: wallet mutations under WALLET_LOCK only flag the
+# user as "dirty" (fast, in-memory, no network I/O while the lock is held).
+# A background thread (wallet_sync_loop, started in main()) flushes dirty
+# wallets to Postgres every couple of seconds. This used to be a synchronous
+# db.save_wallet() call made *inside* WALLET_LOCK on every single bet/win/tip
+# - since WALLET_LOCK is global (shared by every user, not per-user), one
+# slow Postgres write serialized every player's bets behind it. Same
+# write-behind idea periodic_db_sync_loop already uses for active games.
+_dirty_wallets = set()
+
 
 def _ensure_wallet(user_id):
     if user_id not in wallets:
@@ -262,17 +272,40 @@ def _ensure_wallet(user_id):
 
 
 def _persist_wallet(user_id):
-    """Best-effort write-through to Postgres. Failures are logged but never
-    block gameplay - the in-memory value (which the player already saw)
-    stays authoritative for this process's lifetime either way. A DB outage
-    degrades to "acts like the old in-memory-only build" rather than
-    crashing bets."""
+    """Write-behind: just flags this wallet dirty so wallet_sync_loop picks
+    it up on its next pass and writes it to Postgres in the background.
+    Always called from inside WALLET_LOCK, so this must stay a cheap
+    in-memory op - no network I/O here, or every player's bets serialize
+    behind whichever one is currently talking to the DB."""
     if not DB_ENABLED:
         return
-    try:
-        db.save_wallet(user_id, wallets[user_id])
-    except Exception as e:
-        print(f"⚠️ Failed to persist wallet for user {user_id}: {e}")
+    _dirty_wallets.add(user_id)
+
+
+def wallet_sync_loop():
+    """Runs forever in a background thread once DB_ENABLED. Every ~2 seconds,
+    flushes any wallets touched since the last pass to Postgres. The actual
+    db.save_wallet() network calls happen OUTSIDE WALLET_LOCK (we only hold
+    the lock briefly to snapshot which wallets are dirty and copy their
+    current values), so slow/variable Postgres latency no longer blocks
+    gameplay for anyone."""
+    while True:
+        time.sleep(2)
+        if not DB_ENABLED:
+            continue
+        with WALLET_LOCK:
+            if not _dirty_wallets:
+                continue
+            to_flush = {uid: dict(wallets[uid]) for uid in _dirty_wallets if uid in wallets}
+            _dirty_wallets.clear()
+        for user_id, wallet_snapshot in to_flush.items():
+            try:
+                db.save_wallet(user_id, wallet_snapshot)
+            except Exception as e:
+                print(f"⚠️ Failed to persist wallet for user {user_id}: {e}")
+                # Put it back so the next pass retries instead of losing the write.
+                with WALLET_LOCK:
+                    _dirty_wallets.add(user_id)
 
 
 def get_balance(user_id):
@@ -293,13 +326,26 @@ def _fetch_exchange_rates():
     """Refresh the USD->INR and USD->LTC cached rates. Best-effort - on any
     failure the stale cached values (or None on first-ever failure) are
     left in place, so a network hiccup degrades to 'last known rate'
-    rather than breaking the /balance display."""
+    rather than breaking the /balance display.
+
+    Also sanity-bounds whatever comes back: a free third-party rate API
+    occasionally returns a malformed/garbage number (wrong field, stale
+    cached response on their end, a units mixup) without erroring out, and
+    that silently propagates into every INR/LTC bet's math afterwards -
+    this is what was causing bets to come out absurdly small/large. USD/INR
+    has stayed within roughly 30-500 for INR's entire history as a
+    convertible currency; anything outside that is rejected as bad data and
+    the previous (still-cached) rate is kept instead."""
     try:
         resp = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=8)
         data = resp.json()
         rate = data.get("rates", {}).get("INR")
         if rate:
-            _rate_cache["usd_inr"] = float(rate)
+            rate = float(rate)
+            if 30 <= rate <= 500:
+                _rate_cache["usd_inr"] = rate
+            else:
+                print(f"⚠️ USD/INR rate {rate} outside sane bounds (30-500) - ignoring, keeping last known rate {_rate_cache['usd_inr']}")
     except Exception as e:
         print(f"⚠️ Could not refresh USD/INR rate: {e}")
 
@@ -311,16 +357,39 @@ def _fetch_exchange_rates():
         data = resp.json()
         ltc_usd_price = data.get("litecoin", {}).get("usd")
         if ltc_usd_price:
-            _rate_cache["usd_ltc"] = 1 / float(ltc_usd_price)  # how many LTC per 1 USD
+            ltc_usd_price = float(ltc_usd_price)
+            # LTC per 1 USD. Sane as long as 1 LTC is worth somewhere between
+            # $1 and $100,000 - way outside its realistic historical range,
+            # just wide enough to catch actual garbage data.
+            if 1 <= ltc_usd_price <= 100000:
+                _rate_cache["usd_ltc"] = 1 / ltc_usd_price
+            else:
+                print(f"⚠️ LTC/USD price {ltc_usd_price} outside sane bounds - ignoring, keeping last known rate {_rate_cache['usd_ltc']}")
     except Exception as e:
         print(f"⚠️ Could not refresh USD/LTC rate: {e}")
 
     _rate_cache["fetched_at"] = time.time()
 
 
+_rate_refresh_in_flight = threading.Lock()
+
+
 def _get_rates():
+    """Returns the cached rates immediately. If the cache is stale, kicks
+    off a background refresh (rather than blocking this call) and still
+    returns the old-but-serviceable cached value right away - a rate that's
+    a few extra seconds stale is fine, but making whoever happens to trigger
+    the refresh wait up to ~16s for two sequential external HTTP calls is
+    not. `_rate_refresh_in_flight` just prevents piling up duplicate
+    background refreshes if several requests notice the staleness at once."""
     if time.time() - _rate_cache["fetched_at"] > _RATE_CACHE_TTL:
-        _fetch_exchange_rates()
+        if _rate_refresh_in_flight.acquire(blocking=False):
+            def _refresh():
+                try:
+                    _fetch_exchange_rates()
+                finally:
+                    _rate_refresh_in_flight.release()
+            threading.Thread(target=_refresh, daemon=True, name="rate-refresh").start()
     return _rate_cache
 
 
@@ -416,7 +485,9 @@ def resolve_bet_amount(user_id, raw_text):
     if not rate:
         return None, "rate_unavailable"
 
-    return round(raw_value / rate, 2), None
+    usd_amount = round(raw_value / rate, 2)
+    print(f"💱 resolve_bet_amount: user={user_id} typed={raw_value} {currency} rate={rate} -> ${usd_amount}")
+    return usd_amount, None
 
 
 def spend_for_bet(user_id, amount):
@@ -6426,6 +6497,8 @@ def main():
     if DB_ENABLED:
         threading.Thread(target=periodic_db_sync_loop, daemon=True, name="db-sync").start()
         print("💾 Background DB sync started (every 4s).")
+        threading.Thread(target=wallet_sync_loop, daemon=True, name="wallet-sync").start()
+        print("💰 Background wallet sync started (every 2s).")
 
     if APP_URL:
         print(f"🚀 Crash Mini App serving at {APP_URL}/crash/<token>")
