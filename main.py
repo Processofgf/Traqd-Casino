@@ -646,7 +646,7 @@ WINS_MIN_PROFIT = float(os.environ.get("WINS_MIN_PROFIT", "1") or 0)
 # after it (✅ here). That's a Telegram-side rule, not something a bot
 # can change - there's no way to force the custom art for non-Premium
 # accounts.
-WIN_FEED_EMOJI = '<tg-emoji emoji-id="5258073279305889554">✅</tg-emoji>'
+WIN_FEED_EMOJI = '<tg-emoji emoji-id="5190729502069631963">✅</tg-emoji>'
 
 
 def broadcast_win(user_id, username, game, bet_amount, payout_amount, detail=""):
