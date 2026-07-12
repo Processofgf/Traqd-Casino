@@ -17,6 +17,7 @@ import threading
 import queue
 import math
 import io
+import copy
 from roulette_stickers import get_sticker_for_number, get_colour
 
 # Railway (and most container hosts) capture stdout as a pipe, not a TTY -
@@ -114,6 +115,8 @@ def set_house_balance(amount):
 # ---------------------------------------------------------------------------
 _offset_cache = None
 OFFSET_LOCK = threading.Lock()
+_offset_dirty = False
+_offset_write_event = threading.Event()
 
 
 def get_telegram_offset():
@@ -131,15 +134,42 @@ def get_telegram_offset():
 
 
 def set_telegram_offset(value):
-    global _offset_cache
+    """Advances the in-memory offset immediately (this is what the polling
+    loop actually reads to know which update to request next, so gameplay
+    speed never depends on Postgres). The DB write that makes this survive
+    a restart is handed off to _offset_writer_loop() instead of happening
+    here inline - this used to be a synchronous network round-trip on
+    EVERY single incoming message/tap, in the same single thread that also
+    calls getUpdates and dispatches updates, which made the whole bot feel
+    slow under any real traffic. The writer thread below coalesces bursts
+    (10 updates arriving together -> 1 write of the latest offset, not 10),
+    so the crash-recovery guarantee stays effectively as tight as before."""
+    global _offset_cache, _offset_dirty
     with OFFSET_LOCK:
         _offset_cache = int(value)
+        _offset_dirty = True
+    _offset_write_event.set()
+    return _offset_cache
+
+
+def _offset_writer_loop():
+    """Runs forever in its own background thread once DB_ENABLED. Wakes up
+    as soon as set_telegram_offset() has something new to persist, writes
+    only the latest value (older, already-superseded values in the same
+    burst are skipped), then goes back to waiting."""
+    while True:
+        _offset_write_event.wait()
+        _offset_write_event.clear()
+        with OFFSET_LOCK:
+            if not _offset_dirty:
+                continue
+            value_to_write = _offset_cache
+            _offset_dirty = False
         if DB_ENABLED:
             try:
-                db.save_setting("telegram_offset", _offset_cache)
+                db.save_setting("telegram_offset", value_to_write)
             except Exception as e:
                 print(f"⚠️ Could not persist telegram_offset: {e}")
-        return _offset_cache
 
 
 BOT_USERNAME = None
@@ -7382,43 +7412,82 @@ def restore_state_from_db():
             print(f"⚠️ Failed to restore {game_type} games: {e}")
 
 
+_last_synced_game_snapshot = {}  # game_type -> {token: deep-copied state as of the last successful save}
+
+
 def periodic_db_sync_loop():
-    """Runs forever in a background thread once DB_ENABLED. Every ~4
-    seconds: snapshot every active game into Postgres, and clean up rows
-    for games that have since been removed from memory (cashed out,
-    finished and cleared, expired, etc) so the table doesn't grow
-    unbounded."""
+    """Runs forever in a background thread once DB_ENABLED.
+
+    Every ~4 seconds: save only the games that actually changed since the
+    last pass (skips the round-trip for anything untouched, e.g. an idle
+    Mines board waiting on a tap).
+
+    Every ~20 seconds (every 5th tick): also do the more expensive pass -
+    a full read of each game_type's table to find + delete rows for games
+    that have since been removed from memory (cashed out, finished, expired,
+    etc), so the table doesn't grow unbounded. This used to run every single
+    4-second tick regardless of whether anything had changed, which meant
+    ~11 full-table reads (plus a full re-save of every active game, changed
+    or not) hitting Postgres every 4 seconds - real load that competed with
+    actual gameplay queries as more games/users were active at once.
+
+    Note on the dirty-check: game state dicts get mutated in place in a few
+    spots (e.g. Mines does game["revealed"].add(idx)), so comparing against
+    a *live reference* to the same dict would always say "unchanged" (it's
+    literally comparing the object to itself) and silently stop persisting
+    that game after its first save. To avoid that, what's cached for
+    comparison is always a deepcopy taken at save time, never the live
+    dict."""
+    tick = 0
     while True:
         time.sleep(4)
         if not DB_ENABLED:
             continue
+        tick += 1
+        do_full_cleanup = (tick % 5 == 0)  # ~ every 20s instead of every 4s
+
         for game_type, store_dict, keyed_by_token, pointer_dict in _synced_game_stores():
             try:
-                # Snapshot every currently-active game.
+                # Snapshot every currently-active game, but only save the
+                # ones that differ from what we last successfully persisted.
                 snapshot = dict(store_dict)
+                last_synced = _last_synced_game_snapshot.setdefault(game_type, {})
+
                 for key, state in snapshot.items():
                     token = key if keyed_by_token else str(key)
                     user_id = state.get("user_id", key if not keyed_by_token else None)
                     if user_id is None:
                         continue
+                    if token in last_synced and last_synced[token] == state:
+                        continue  # unchanged since last save - skip the DB round trip
                     db.save_game(game_type, token, user_id, state)
+                    last_synced[token] = copy.deepcopy(state)
 
-                # Clean up any DB rows for games no longer in memory (they
-                # finished/cashed-out/expired since the last sync).
-                db_tokens = set(db.load_all_games(game_type).keys())
-                memory_tokens = {str(k) for k in snapshot.keys()}
-                stale = db_tokens - memory_tokens
-                for token in stale:
-                    db.delete_game(game_type, token)
+                # Drop cached snapshots for games no longer in memory at all,
+                # so this cache doesn't grow unbounded over a long uptime.
+                memory_tokens = {(k if keyed_by_token else str(k)) for k in snapshot.keys()}
+                for stale_key in set(last_synced.keys()) - memory_tokens:
+                    last_synced.pop(stale_key, None)
 
-                # Keep the user->token pointer table in sync too.
+                # Keep the user->token pointer table in sync every tick -
+                # these are small individual upserts, not a full-table op.
                 if keyed_by_token and pointer_dict is not None:
                     pointer_snapshot = dict(pointer_dict)
                     for user_id, token in pointer_snapshot.items():
                         db.set_active_pointer(game_type, user_id, token)
-                    db_pointers = db.load_all_active_pointers(game_type)
-                    for user_id in set(db_pointers.keys()) - set(pointer_snapshot.keys()):
-                        db.clear_active_pointer(game_type, user_id)
+
+                if do_full_cleanup:
+                    # Clean up any DB rows for games no longer in memory
+                    # (they finished/cashed-out/expired since the last sync).
+                    db_tokens = set(db.load_all_games(game_type).keys())
+                    stale = db_tokens - memory_tokens
+                    for token in stale:
+                        db.delete_game(game_type, token)
+
+                    if keyed_by_token and pointer_dict is not None:
+                        db_pointers = db.load_all_active_pointers(game_type)
+                        for user_id in set(db_pointers.keys()) - set(pointer_snapshot.keys()):
+                            db.clear_active_pointer(game_type, user_id)
             except Exception as e:
                 print(f"⚠️ DB sync error for {game_type}: {e}")
 
@@ -7522,6 +7591,11 @@ def main():
     # service.
     crash_web.init_extra_modules([blackjack_web, dice_web, chickenroad_web, nowpayments_web])
     crash_web.start_in_background()
+
+    # Always started (not just when DB_ENABLED) since set_telegram_offset()
+    # calls into this unconditionally - it just idles harmlessly with
+    # nothing to persist if there's no DB.
+    threading.Thread(target=_offset_writer_loop, daemon=True, name="offset-writer").start()
 
     if DB_ENABLED:
         threading.Thread(target=periodic_db_sync_loop, daemon=True, name="db-sync").start()
