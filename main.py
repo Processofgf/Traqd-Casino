@@ -117,7 +117,7 @@ def fetch_bot_username():
 
 STARTING_BALANCE = 0.00
 MIN_BET = 0.10
-MAX_BET = 5000.00
+MAX_BET = 100.00
 
 MIN_DEPOSIT = 3.00
 MIN_WITHDRAW = 10.00
@@ -478,7 +478,17 @@ def resolve_bet_amount(user_id, raw_text):
     what makes /currency actually change what you PLAY with, not just how
     the balance is displayed - a user on INR typing '100' means ₹100, not
     $100. Returns (usd_amount, error) where error is None on success, or
-    one of "invalid_number" / "rate_unavailable"."""
+    one of "invalid_number" / "rate_unavailable".
+
+    The special keyword "all" bets the user's entire balance. Balance is
+    already stored in USD internally, so this skips currency conversion
+    entirely (there's nothing to convert - it's not a typed number in the
+    user's display currency, it's a direct request for "everything I have").
+    The MIN_BET/MAX_BET checks in each game handler still apply afterwards,
+    so an all-in that exceeds MAX_BET gets rejected there like any other bet."""
+    if isinstance(raw_text, str) and raw_text.strip().lower() == "all":
+        return round(get_balance(user_id), 2), None
+
     try:
         raw_value = float(raw_text)
     except (ValueError, TypeError):
@@ -2533,7 +2543,7 @@ ROULETTE_HEADER_EMOJI = '<tg-emoji emoji-id="5924675271914426175">🎰</tg-emoji
 
 def handle_roulette_command(chat_id, user_id, username, args):
     if not args:
-        send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Usage: <code>/roulette &lt;amount&gt;</code>\nExample: <code>/roulette 10</code>")
+        send_message(chat_id, f"{ROULETTE_WARN_EMOJI} Usage: <code>/roulette &lt;amount&gt;</code>\nExample: <code>/roulette 10</code> or <code>/roulette all</code>")
         return
 
     amount, _amt_err = resolve_bet_amount(user_id, args[0])
@@ -3385,7 +3395,7 @@ def handle_limbo_command(chat_id, user_id, username, args):
         send_message(
             chat_id,
             f'{WARN_EMOJI} Usage: <code>/limbo &lt;amount&gt; &lt;target&gt;</code>\n'
-            "Example: <code>/limbo 10 5.00</code>"
+            "Example: <code>/limbo 10 5.00</code> or <code>/limbo all 5.00</code>"
         )
         return
 
@@ -3491,7 +3501,7 @@ def handle_coinflip_command(chat_id, user_id, username, args):
         send_message(
             chat_id,
             f'{WARN_EMOJI} Usage: <code>/coinflip &lt;amount&gt; &lt;heads|tails&gt;</code>\n'
-            "Example: <code>/coinflip 10 heads</code>"
+            "Example: <code>/coinflip 10 heads</code> or <code>/coinflip all heads</code>"
         )
         return
 
@@ -3657,7 +3667,7 @@ def mines_grid_keyboard(user_id, revealed, bomb_count, current_multiplier,
 
 def handle_mines_command(chat_id, user_id, username, args):
     if not args:
-        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/mines &lt;amount&gt;</code>\nExample: <code>/mines 10</code>")
+        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/mines &lt;amount&gt;</code>\nExample: <code>/mines 10</code> or <code>/mines all</code>")
         return
 
     amount, _amt_err = resolve_bet_amount(user_id, args[0])
@@ -3808,7 +3818,7 @@ def towers_grid_keyboard(user_id, game, game_over=False):
 
 def handle_towers_command(chat_id, user_id, username, args):
     if not args:
-        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/towers &lt;amount&gt;</code>\nExample: <code>/towers 10</code>")
+        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/towers &lt;amount&gt;</code>\nExample: <code>/towers 10</code> or <code>/towers all</code>")
         return
 
     amount, _amt_err = resolve_bet_amount(user_id, args[0])
@@ -3974,7 +3984,7 @@ def keno_result_keyboard(user_id, selected, drawn_numbers, server_seed, client_s
 
 def handle_keno_command(chat_id, user_id, username, args):
     if not args:
-        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/keno &lt;amount&gt;</code>\nExample: <code>/keno 10</code>")
+        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/keno &lt;amount&gt;</code>\nExample: <code>/keno 10</code> or <code>/keno all</code>")
         return
 
     amount, _amt_err = resolve_bet_amount(user_id, args[0])
@@ -4230,7 +4240,7 @@ def handle_crash_command(chat_id, user_id, username, args, chat_type="private", 
         amount = pre_resolved_usd_amount
     else:
         if not args:
-            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/crash &lt;amount&gt;</code>\nExample: <code>/crash 10</code>")
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/crash &lt;amount&gt;</code>\nExample: <code>/crash 10</code> or <code>/crash all</code>")
             return
 
         amount, _amt_err = resolve_bet_amount(user_id, args[0])
@@ -4795,7 +4805,7 @@ def handle_blackjack_command(chat_id, user_id, username, args, chat_type="privat
         amount = pre_resolved_usd_amount
     else:
         if not args:
-            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/blackjack &lt;amount&gt;</code>\nExample: <code>/blackjack 10</code>")
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/blackjack &lt;amount&gt;</code>\nExample: <code>/blackjack 10</code> or <code>/blackjack all</code>")
             return
         amount, _amt_err = resolve_bet_amount(user_id, args[0])
         if _amt_err == "invalid_number":
@@ -5392,13 +5402,9 @@ def handle_message(message):
         return
 
     if command == "/housebalance":
-        # Admin-only, deliberately NOT listed in /help or the command menu.
-        # Just displays back whatever /sethousebalance last set - not
-        # derived from wallets/deposits/anything else, so anyone but an
-        # admin asking for it gets silently ignored rather than a real
-        # (or fake) number.
-        if not is_admin(user_id):
-            return
+        # Now open to everyone - just displays back whatever /sethousebalance
+        # last set. /sethousebalance itself stays admin-only below, since
+        # that's the command that actually changes the number.
         send_message(chat_id, f"🏦 House balance: <b>${get_house_balance():,.2f}</b>")
         return
 
@@ -5875,7 +5881,7 @@ def handle_chicken_command(chat_id, user_id, username, args, chat_type="private"
         amount = pre_resolved_usd_amount
     else:
         if not args:
-            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/chickenroad &lt;amount&gt;</code>\nExample: <code>/chickenroad 10</code>")
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/chickenroad &lt;amount&gt;</code>\nExample: <code>/chickenroad 10</code> or <code>/chickenroad all</code>")
             return
         amount, _amt_err = resolve_bet_amount(user_id, args[0])
         if _amt_err == "invalid_number":
@@ -6205,7 +6211,7 @@ def handle_dice_command(chat_id, user_id, username, args, chat_type="private", p
         amount = pre_resolved_usd_amount
     else:
         if not args:
-            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/dice &lt;amount&gt;</code>\nExample: <code>/dice 10</code>")
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/dice &lt;amount&gt;</code>\nExample: <code>/dice 10</code> or <code>/dice all</code>")
             return
         amount, _amt_err = resolve_bet_amount(user_id, args[0])
         if _amt_err == "invalid_number":
