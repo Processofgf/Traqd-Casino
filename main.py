@@ -587,6 +587,53 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
     return api_call("sendMessage", **params)
 
 
+# ---------------------------------------------------------------------------
+# WINS FEED — every game, every win, posted into one public channel.
+#
+# Set WINS_CHANNEL_ID to the channel's id (e.g. -1001234567890) once the
+# bot has been added to that channel as admin with "Post Messages"
+# permission. Leave it unset and this silently does nothing - no game is
+# ever blocked or slowed down waiting on this.
+# ---------------------------------------------------------------------------
+WINS_CHANNEL_ID = os.environ.get("WINS_CHANNEL_ID", "").strip()
+
+# Minimum payout (profit, not stake back) worth posting - keeps the feed
+# from being spammed with $0.10 dice wins. Override with WINS_MIN_PROFIT.
+WINS_MIN_PROFIT = float(os.environ.get("WINS_MIN_PROFIT", "0") or 0)
+
+# One custom emoji for every win, regardless of game - keeps the feed
+# looking like a single clean ticker instead of a wall of random icons.
+WIN_FEED_EMOJI = '<tg-emoji emoji-id="5258073279305889554">✅</tg-emoji>'
+
+
+def broadcast_win(user_id, username, game, bet_amount, payout_amount, detail=""):
+    """Posts a win to the public wins-feed channel. Fire-and-forget: any
+    failure here (channel not set, bot not admin there, network hiccup)
+    is swallowed so it can never break the game flow that triggered it.
+
+    profit = payout_amount - bet_amount is what gets checked against
+    WINS_MIN_PROFIT and shown as the headline number - a $10 bet that pays
+    back $10.50 reads a lot better as "+$0.50" than as "won $10.50"."""
+    if not WINS_CHANNEL_ID:
+        return
+    try:
+        profit = round(payout_amount - bet_amount, 2)
+        if profit < WINS_MIN_PROFIT:
+            return
+        multiplier_txt = ""
+        if bet_amount > 0:
+            multiplier_txt = f" · {payout_amount / bet_amount:.2f}x"
+        text = (
+            f"{WIN_FEED_EMOJI} {mention(user_id, username)} just won <b>${profit:.2f}</b> "
+            f"on <b>{game}</b>{multiplier_txt}"
+        )
+        if detail:
+            text += f"\n{detail}"
+        send_message(WINS_CHANNEL_ID, text)
+    except Exception as e:
+        print(f"broadcast_win failed (game={game}, user_id={user_id}): {e}")
+
+
 def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"):
     params = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": parse_mode}
     if reply_markup:
@@ -2016,6 +2063,7 @@ def handle_callback(callback_query):
             payout = amount * multiplier
             profit = payout - amount
             adjust_balance(owner_id, payout)
+            broadcast_win(owner_id, username, "Mines", amount, payout, detail=f"Cleared the board · {bomb_count} mines")
             with MINES_LOCK:
                 active_mines_games.pop(owner_id, None)
             new_balance = get_balance(owner_id)
@@ -2074,6 +2122,7 @@ def handle_callback(callback_query):
         profit = payout - amount
 
         adjust_balance(owner_id, payout)
+        broadcast_win(owner_id, username, "Mines", amount, payout, detail=f"Cashed out · {bomb_count} mines, {revealed_count} tiles")
         with MINES_LOCK:
             active_mines_games.pop(owner_id, None)
 
@@ -2211,6 +2260,7 @@ def handle_callback(callback_query):
             payout = amount * multiplier
             profit = payout - amount
             adjust_balance(owner_id, payout)
+            broadcast_win(owner_id, username, "Towers", amount, payout, detail=f"Conquered the tower · {label}")
             game["current_row"] = current_row + 1
             with TOWERS_LOCK:
                 active_towers_games.pop(owner_id, None)
@@ -2263,6 +2313,7 @@ def handle_callback(callback_query):
         profit = payout - amount
 
         adjust_balance(owner_id, payout)
+        broadcast_win(owner_id, username, "Towers", amount, payout, detail=f"Cashed out · {label}, row {rows_cleared}")
         with TOWERS_LOCK:
             active_towers_games.pop(owner_id, None)
 
@@ -2412,6 +2463,8 @@ def handle_callback(callback_query):
 
         if payout > 0:
             adjust_balance(owner_id, payout)
+            if profit > 0:
+                broadcast_win(owner_id, username, "Keno", amount, payout, detail=f"{hits}/{picks} hits · {risk.capitalize()} risk")
 
         with KENO_LOCK:
             active_keno_games.pop(owner_id, None)
@@ -2576,6 +2629,9 @@ def handle_callback(callback_query):
         colour_emoji = {"red": "🔴", "black": "⚫", "green": "🟢"}[result_colour]
         bet_display = f"Number {bet_value}" if bet_type == "number" else BET_LABELS.get(bet_type, bet_type)
 
+        if win:
+            broadcast_win(owner_id, username, "Roulette", amount, payout, detail=f"{bet_display} · landed on {result_number}")
+
         roulette_win_emoji = '<tg-emoji emoji-id="5413566144986503832">🏆</tg-emoji>'
         roulette_wins_emoji = '<tg-emoji emoji-id="6300733352697661457">🔥</tg-emoji>'
         roulette_balance_emoji = '<tg-emoji emoji-id="5409048419211682843">💰</tg-emoji>'
@@ -2693,6 +2749,7 @@ def handle_limbo_command(chat_id, user_id, username, args):
 
     if win:
         adjust_balance(user_id, payout)
+        broadcast_win(user_id, username, "Limbo", amount, payout, detail=f"Target {target:g}x · Rolled {result_multiplier:.2f}x")
 
     new_balance = get_balance(user_id)
 
@@ -2804,6 +2861,7 @@ def handle_coinflip_command(chat_id, user_id, username, args):
 
         if win:
             adjust_balance(user_id, payout)
+            broadcast_win(user_id, username, "Coinflip", amount, payout, detail=f"Called {guess}, landed {result}")
 
         new_balance = get_balance(user_id)
 
@@ -3436,6 +3494,7 @@ def crash_attempt_cashout(token):
         user_id, chat_id, username, amount = game["user_id"], game["chat_id"], game["username"], game["amount"]
 
     adjust_balance(user_id, payout)
+    broadcast_win(user_id, username, "Crash", amount, payout, detail=f"Cashed out at {current:.2f}x")
     send_message(
         chat_id,
         f"{CRASH_ROCKET_EMOJI} <b>Crash</b> — {mention(user_id, username)}\n\n"
@@ -3938,6 +3997,7 @@ def _bj_settle(game, user_id, chat_id, username, summary):
     lines.append("")
     if profit > 0:
         lines.append(f"{cemoji('money')} You won <b>${profit:.2f}</b>! Balance: <b>${get_balance(user_id):.2f}</b>")
+        broadcast_win(user_id, username, "Blackjack", summary["total_bet"], summary["total_payout"])
     elif profit < 0:
         lines.append(f"{cemoji('money')} You lost <b>${-profit:.2f}</b>. Balance: <b>${get_balance(user_id):.2f}</b>")
     else:
@@ -4892,6 +4952,7 @@ def chicken_step(token):
     if full_clear:
         payout = round(amount * multiplier, 2)
         adjust_balance(user_id, payout)
+        broadcast_win(user_id, username, "Chicken Road", amount, payout, detail=f"Crossed all {CHICKEN_LANES} lanes")
         send_message(
             chat_id,
             f"{CHICKEN_EMOJI} <b>Chicken Road</b> — {mention(user_id, username)}\n\n"
@@ -4935,6 +4996,7 @@ def chicken_cashout(token):
         server_seed, client_seed, nonce = game["server_seed"], game["client_seed"], game["nonce"]
 
     adjust_balance(user_id, payout)
+    broadcast_win(user_id, username, "Chicken Road", amount, payout, detail=f"Cashed out after {lane_index} lane{'s' if lane_index != 1 else ''} at {multiplier:.2f}x")
     send_message(
         chat_id,
         f"{CHICKEN_EMOJI} <b>Chicken Road</b> — {mention(user_id, username)}\n\n"
@@ -5247,6 +5309,7 @@ def dice_roll(token, requested_amount=None, requested_direction=None, requested_
         payout = round(amount * multiplier, 2) if win else 0.0
         if win:
             adjust_balance(game["user_id"], payout)
+            broadcast_win(game["user_id"], game["username"], "Dice", amount, payout, detail=f"Rolled {roll:.2f}, needed {'under' if direction == 'under' else 'over'} {target:.2f}")
 
         game.update({
             "amount": amount, "direction": direction, "target": target,
