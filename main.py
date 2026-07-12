@@ -13,6 +13,7 @@ import secrets
 import hashlib
 import html
 import threading
+import queue
 import math
 from roulette_stickers import get_sticker_for_number, get_colour
 
@@ -135,6 +136,54 @@ user_active_crash = {}    # user_id -> token (one live crash round per user)
 client_seeds = {}         # user_id -> client seed string (provably fair)
 nonces = {}               # user_id -> int, increments every bet
 fair_verifications = {}   # short token -> (game, params, server_seed, client_seed, nonce)
+# ---------------------------------------------------------------------------
+# PER-USER SEQUENTIAL DISPATCH
+#
+# main()'s polling loop used to fire off a brand-new, fully independent
+# thread for every single incoming update. That's fine for throughput across
+# *different* users, but for the SAME user tapping several inline-keyboard
+# buttons quickly (e.g. Mines tiles), Telegram delivers those taps as
+# separate updates almost simultaneously - and nothing forced them to be
+# *processed* (or for their edit_message replies to *land*) in the order
+# they were sent. Game state itself (revealed tiles, balances, etc.) is
+# mutated correctly under the various *_LOCKs, but the outgoing
+# editMessageText calls could still reach Telegram out of order, so the
+# board shown on screen could lag behind the true (correct) game state.
+#
+# Fix: every update belonging to a given Telegram user is pushed onto a
+# small FIFO queue, and a single dedicated worker thread per user drains
+# that queue one task at a time - guaranteeing updates from that user are
+# both processed AND replied to in the exact order Telegram delivered them.
+# Different users still run fully in parallel (each gets their own worker),
+# so overall bot throughput is unaffected.
+# ---------------------------------------------------------------------------
+_user_queues = {}
+_user_queues_lock = threading.Lock()
+
+
+def _user_worker(user_id, q):
+    while True:
+        task = q.get()
+        if task is None:
+            return
+        try:
+            task()
+        except Exception as e:
+            print(f"Error processing update for user {user_id}: {e}")
+
+
+def dispatch_for_user(user_id, task):
+    """Runs `task` on a per-user FIFO worker so updates from the same user
+    are always handled strictly in the order they were received."""
+    with _user_queues_lock:
+        q = _user_queues.get(user_id)
+        if q is None:
+            q = queue.Queue()
+            _user_queues[user_id] = q
+            threading.Thread(target=_user_worker, args=(user_id, q), daemon=True, name=f"user-{user_id}").start()
+    q.put(task)
+
+
 BALANCE_LOCK = threading.Lock()
 MINES_LOCK = threading.Lock()
 TOWERS_LOCK = threading.Lock()
@@ -5889,7 +5938,23 @@ def main():
                     except Exception as e:
                         print(f"Error handling update: {e}")
 
-                threading.Thread(target=process, daemon=True).start()
+                # Figure out which Telegram user this update belongs to, so
+                # taps/messages from the SAME user are always processed (and
+                # replied to) strictly in the order Telegram sent them. This
+                # is what prevents rapid-fire Mines tile taps from updating
+                # game state correctly but showing a stale/out-of-order
+                # board. Different users still run fully in parallel.
+                if "callback_query" in update:
+                    dispatch_user_id = update["callback_query"]["from"]["id"]
+                elif "message" in update:
+                    dispatch_user_id = update["message"]["from"]["id"]
+                else:
+                    dispatch_user_id = None
+
+                if dispatch_user_id is not None:
+                    dispatch_for_user(dispatch_user_id, process)
+                else:
+                    threading.Thread(target=process, daemon=True).start()
 
         except requests.exceptions.RequestException as e:
             print(f"Network error: {e}, retrying...")
