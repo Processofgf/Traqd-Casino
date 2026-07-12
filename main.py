@@ -307,6 +307,31 @@ WALLET_LOCK = threading.Lock()
 _dirty_wallets = set()
 
 
+def _prime_wallet_cache(user_id):
+    """Loads user_id's wallet from Postgres into the in-memory cache if it
+    isn't cached yet - WITHOUT holding WALLET_LOCK. Every wallet-mutating
+    function below calls this right before taking WALLET_LOCK.
+
+    Why this matters: WALLET_LOCK is one single global lock shared by every
+    player's bets/balance checks. Previously, the very first wallet touch
+    for any user (e.g. their first bet after a restart) did its Postgres
+    read for db.load_wallet() while HOLDING that lock - so with several
+    people playing at once, one person's DB round-trip stalled everyone
+    else's game actions too, which is exactly what "bot freezes when 5-6
+    people play together" looks like. Now the slow I/O happens before the
+    lock is taken, so it only ever delays the one user it belongs to.
+    _ensure_wallet() is untouched and still does its own (now-redundant,
+    harmless) DB-load-under-lock as a fallback for any caller that skips
+    priming."""
+    if DB_ENABLED and user_id not in wallets:
+        loaded = db.load_wallet(user_id)
+        if loaded:
+            loaded.setdefault("deposit_wager_required", 0.0)
+            loaded.setdefault("deposit_wager_progress", 0.0)
+            with WALLET_LOCK:
+                wallets.setdefault(user_id, loaded)
+
+
 def _ensure_wallet(user_id):
     if user_id not in wallets:
         loaded = db.load_wallet(user_id) if DB_ENABLED else None
@@ -369,12 +394,14 @@ def wallet_sync_loop():
 def get_balance(user_id):
     """Total spendable balance (real + bonus combined) - used everywhere
     games already check 'can I afford this bet'."""
+    _prime_wallet_cache(user_id)
     with WALLET_LOCK:
         w = _ensure_wallet(user_id)
         return round(w["real"] + w["bonus"], 2)
 
 
 def get_wallet_breakdown(user_id):
+    _prime_wallet_cache(user_id)
     with WALLET_LOCK:
         w = _ensure_wallet(user_id)
         return dict(w)
@@ -558,6 +585,7 @@ def spend_for_bet(user_id, amount):
     proportionally. Also advances wager progress by the full bet amount
     regardless of which pool funded it - wagering requirements count ALL
     play, not just bonus-funded play, which is the standard/fair approach."""
+    _prime_wallet_cache(user_id)
     with WALLET_LOCK:
         w = _ensure_wallet(user_id)
         total = w["real"] + w["bonus"]
@@ -590,6 +618,7 @@ def credit_winnings(user_id, payout, bonus_portion, real_portion, bet_amount):
     a bet split 60% bonus / 40% real pays out 60% into bonus_balance and
     40% into real_balance. If the bet was funded entirely from one pool
     (the overwhelmingly common case), the whole payout goes there."""
+    _prime_wallet_cache(user_id)
     with WALLET_LOCK:
         w = _ensure_wallet(user_id)
         if bet_amount <= 0:
@@ -620,6 +649,7 @@ def adjust_balance(user_id, delta):
     bypassing the wagering requirement. Fixed by remembering the bonus/real
     split from the matching bet (via _last_bet_split) and crediting the
     payout back in that same proportion, same as credit_winnings() does."""
+    _prime_wallet_cache(user_id)
     with WALLET_LOCK:
         w = _ensure_wallet(user_id)
         if delta < 0:
@@ -667,6 +697,7 @@ def get_withdrawable_balance(user_id):
     before any of it - or anything won while playing it - can be cashed
     out. This is the standard "wager the deposit once" anti-abuse rule and
     applies even if there's no bonus involved."""
+    _prime_wallet_cache(user_id)
     with WALLET_LOCK:
         w = _ensure_wallet(user_id)
         if w["wager_required"] <= 0 and w["bonus"] > 0:
@@ -689,6 +720,7 @@ def grant_test_funds(uid, fund_amount):
     recipient - otherwise tipping would be a loophole to launder test
     money into real withdrawable balance)."""
     grant_token = time.time()
+    _prime_wallet_cache(uid)
     with WALLET_LOCK:
         w = _ensure_wallet(uid)
         existing = test_fund_grants.get(uid)
@@ -714,6 +746,7 @@ def grant_test_funds(uid, fund_amount):
         grant = test_fund_grants.get(u)
         if not grant or grant["token"] != token:
             return
+        _prime_wallet_cache(u)
         with WALLET_LOCK:
             w2 = _ensure_wallet(u)
             w2["bonus"] = max(0.0, round(w2["bonus"] - grant["total_test_amount"], 2))
@@ -739,6 +772,8 @@ def process_tip(sender_id, recipient_id, amount):
     the recipient via grant_test_funds() - so tipped test money is exactly
     as non-withdrawable and time-limited for the recipient as it was for
     the sender. Returns (ok, reason)."""
+    _prime_wallet_cache(sender_id)
+    _prime_wallet_cache(recipient_id)
     with WALLET_LOCK:
         sw = _ensure_wallet(sender_id)
         sender_grant = test_fund_grants.get(sender_id)
@@ -1899,6 +1934,7 @@ def _apply_first_deposit_bonus(user_id, usd_amount):
     50x wagering requirement on that bonus amount specifically (separate
     from the 1x deposit-wager requirement applied to every deposit by
     _apply_deposit_wager_requirement)."""
+    _prime_wallet_cache(user_id)
     with WALLET_LOCK:
         w = _ensure_wallet(user_id)
         if w["has_deposited"]:
@@ -1916,6 +1952,7 @@ def _apply_deposit_wager_requirement(user_id, usd_amount):
     balance (deposits + any winnings) stays locked from withdrawal until
     that volume has been wagered. Returns the new total requirement so
     callers can show it to the player."""
+    _prime_wallet_cache(user_id)
     with WALLET_LOCK:
         w = _ensure_wallet(user_id)
         w["deposit_wager_required"] = round(
@@ -2295,24 +2332,64 @@ def handle_payout_ipn(payload):
     print(f"Payout IPN: {payload}")
 
 
+_dirty_fairness = set()  # user_ids with a seed/nonce change not yet flushed to Postgres
+
+
+def _prime_fairness_cache(user_id):
+    """Loads user_id's client seed/nonce from Postgres into the in-memory
+    cache if not already cached - WITHOUT holding CLIENT_SEED_LOCK. Same
+    reasoning as _prime_wallet_cache: this lock is shared by every player's
+    bets (next_nonce() runs once per bet across every provably-fair game),
+    so doing the DB read while holding it would stall everyone else's bets
+    behind one person's Postgres round-trip."""
+    if DB_ENABLED and user_id not in client_seeds:
+        loaded = db.load_fairness(user_id)
+        if loaded:
+            with CLIENT_SEED_LOCK:
+                if user_id not in client_seeds:
+                    client_seeds[user_id] = loaded["client_seed"]
+                    nonces[user_id] = loaded["nonce"]
+
+
+def fairness_sync_loop():
+    """Runs forever in a background thread once DB_ENABLED, mirroring
+    wallet_sync_loop. Every ~2 seconds, flushes any seed/nonce touched since
+    the last pass to Postgres. The actual db.save_fairness() network calls
+    happen OUTSIDE CLIENT_SEED_LOCK - previously next_nonce() (called once
+    per bet, on every provably-fair game) did that Postgres write
+    synchronously WHILE HOLDING the lock, so with several people playing at
+    once, one person's slow write stalled every other player's bet behind
+    the same global lock. Now it's write-behind, same tradeoff already
+    accepted for wallets: a crash can lose up to ~2s of the most recent
+    nonce bumps."""
+    while True:
+        time.sleep(2)
+        if not DB_ENABLED:
+            continue
+        with CLIENT_SEED_LOCK:
+            if not _dirty_fairness:
+                continue
+            to_flush = {uid: (client_seeds[uid], nonces[uid]) for uid in _dirty_fairness if uid in client_seeds}
+            _dirty_fairness.clear()
+        for user_id, (seed, nonce) in to_flush.items():
+            try:
+                db.save_fairness(user_id, seed, nonce)
+            except Exception as e:
+                print(f"⚠️ Failed to persist fairness for user {user_id}: {e}")
+                with CLIENT_SEED_LOCK:
+                    _dirty_fairness.add(user_id)
+
+
 def get_client_seed(user_id):
     """Returns the user's current client seed, generating a random one the
     first time they're seen (checking the DB before generating fresh, so a
     restart doesn't silently reset everyone's provably-fair seed)."""
+    _prime_fairness_cache(user_id)
     with CLIENT_SEED_LOCK:
         if user_id not in client_seeds:
-            loaded = db.load_fairness(user_id) if DB_ENABLED else None
-            if loaded:
-                client_seeds[user_id] = loaded["client_seed"]
-                nonces[user_id] = loaded["nonce"]
-            else:
-                client_seeds[user_id] = secrets.token_hex(8)
-                nonces[user_id] = 0
-                if DB_ENABLED:
-                    try:
-                        db.save_fairness(user_id, client_seeds[user_id], 0)
-                    except Exception as e:
-                        print(f"⚠️ Failed to persist fairness for user {user_id}: {e}")
+            client_seeds[user_id] = secrets.token_hex(8)
+            nonces[user_id] = 0
+            _dirty_fairness.add(user_id)
         return client_seeds[user_id]
 
 
@@ -2321,11 +2398,7 @@ def set_client_seed(user_id, seed):
     with CLIENT_SEED_LOCK:
         client_seeds[user_id] = seed
         nonces[user_id] = 0
-        if DB_ENABLED:
-            try:
-                db.save_fairness(user_id, seed, 0)
-            except Exception as e:
-                print(f"⚠️ Failed to persist fairness for user {user_id}: {e}")
+        _dirty_fairness.add(user_id)
 
 
 def get_nonce(user_id):
@@ -2336,21 +2409,13 @@ def get_nonce(user_id):
 def next_nonce(user_id):
     """Call once per bet - bumps and returns the nonce for this user, so the
     same client seed never produces the same result twice."""
+    _prime_fairness_cache(user_id)
     with CLIENT_SEED_LOCK:
         if user_id not in client_seeds:
-            loaded = db.load_fairness(user_id) if DB_ENABLED else None
-            if loaded:
-                client_seeds[user_id] = loaded["client_seed"]
-                nonces[user_id] = loaded["nonce"]
-            else:
-                client_seeds[user_id] = secrets.token_hex(8)
-                nonces[user_id] = 0
+            client_seeds[user_id] = secrets.token_hex(8)
+            nonces[user_id] = 0
         nonces[user_id] = nonces.get(user_id, 0) + 1
-        if DB_ENABLED:
-            try:
-                db.save_fairness(user_id, client_seeds[user_id], nonces[user_id])
-            except Exception as e:
-                print(f"⚠️ Failed to persist fairness for user {user_id}: {e}")
+        _dirty_fairness.add(user_id)
         return nonces[user_id]
 
 
@@ -7528,6 +7593,8 @@ def main():
         print("💾 Background DB sync started (every 4s).")
         threading.Thread(target=wallet_sync_loop, daemon=True, name="wallet-sync").start()
         print("💰 Background wallet sync started (every 2s).")
+        threading.Thread(target=fairness_sync_loop, daemon=True, name="fairness-sync").start()
+        print("🎲 Background fairness (seed/nonce) sync started (every 2s).")
 
     if APP_URL:
         print(f"🚀 Crash Mini App serving at {APP_URL}/crash/<token>")
