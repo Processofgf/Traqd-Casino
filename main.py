@@ -19,7 +19,7 @@ import io
 from roulette_stickers import get_sticker_for_number, get_colour
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
@@ -659,19 +659,6 @@ def cemoji(key):
     return f'<tg-emoji emoji-id="{e["id"]}">{e["fallback"]}</tg-emoji>'
 
 
-def check_for_custom_emoji_ids(message):
-    entities = message.get("entities", []) or message.get("caption_entities", [])
-    custom = [e for e in entities if e.get("type") == "custom_emoji"]
-    if not custom:
-        return False
-    chat_id = message["chat"]["id"]
-    lines = ["🔍 <b>Custom emoji id(s) found:</b>"]
-    for e in custom:
-        lines.append(f'<code>{e["custom_emoji_id"]}</code>')
-    send_message(chat_id, "\n".join(lines))
-    return True
-
-
 def send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
     params = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     if reply_markup:
@@ -712,8 +699,34 @@ WIN_FEED_EMOJI = '<tg-emoji emoji-id="5190729502069631963">✅</tg-emoji>'
 # that outcome also gets posted to the public wins channel (broadcast_win
 # only fires above WINS_MIN_PROFIT, but stats should count everything).
 # ---------------------------------------------------------------------------
-user_stats = {}   # user_id -> {"username","games_played","total_wagered","total_won","biggest_win","net_profit"}
+user_stats = {}   # user_id -> stats dict, see _new_stats_entry() below
 STATS_LOCK = threading.Lock()
+
+
+def _new_stats_entry(username):
+    return {
+        "username": username or "Player",
+        "games_played": 0,
+        "wins_count": 0,
+        "total_wagered": 0.0,
+        "total_won": 0.0,
+        "biggest_win": 0.0,
+        "biggest_loss": 0.0,
+        "net_profit": 0.0,
+        "current_streak": 0,
+        "streak_type": None,   # "win" | "loss" | None
+        "deposits_total": 0.0,
+        "withdrawals_total": 0.0,
+        "joined_at": time.time(),
+    }
+
+
+def _persist_stats(user_id, snapshot):
+    if DB_ENABLED:
+        try:
+            db.save_setting(f"stats:{user_id}", json.dumps(snapshot))
+        except Exception as e:
+            print(f"⚠️ Could not persist stats for user {user_id}: {e}")
 
 
 def record_bet_result(user_id, username, game, wagered, payout):
@@ -724,14 +737,7 @@ def record_bet_result(user_id, username, game, wagered, payout):
     with STATS_LOCK:
         s = user_stats.get(user_id)
         if s is None:
-            s = {
-                "username": username or "Player",
-                "games_played": 0,
-                "total_wagered": 0.0,
-                "total_won": 0.0,
-                "biggest_win": 0.0,
-                "net_profit": 0.0,
-            }
+            s = _new_stats_entry(username)
             user_stats[user_id] = s
         if username:
             s["username"] = username
@@ -739,14 +745,66 @@ def record_bet_result(user_id, username, game, wagered, payout):
         s["total_wagered"] = round(s["total_wagered"] + wagered, 2)
         s["total_won"] = round(s["total_won"] + payout, 2)
         s["net_profit"] = round(s["net_profit"] + profit, 2)
-        if profit > s["biggest_win"]:
-            s["biggest_win"] = profit
+        if profit > 0:
+            s["wins_count"] += 1
+            if profit > s["biggest_win"]:
+                s["biggest_win"] = profit
+            if s["streak_type"] == "win":
+                s["current_streak"] += 1
+            else:
+                s["streak_type"] = "win"
+                s["current_streak"] = 1
+        elif profit < 0:
+            loss_amt = -profit
+            if loss_amt > s["biggest_loss"]:
+                s["biggest_loss"] = loss_amt
+            if s["streak_type"] == "loss":
+                s["current_streak"] += 1
+            else:
+                s["streak_type"] = "loss"
+                s["current_streak"] = 1
         snapshot = dict(s)
-    if DB_ENABLED:
-        try:
-            db.save_setting(f"stats:{user_id}", json.dumps(snapshot))
-        except Exception as e:
-            print(f"⚠️ Could not persist stats for user {user_id}: {e}")
+    _persist_stats(user_id, snapshot)
+
+
+def record_deposit(user_id, amount):
+    """Adds a completed deposit's USD amount into lifetime stats (for the
+    Deposits card on /stats). Separate from wallet balance tracking."""
+    with STATS_LOCK:
+        s = user_stats.get(user_id)
+        if s is None:
+            s = _new_stats_entry(None)
+            user_stats[user_id] = s
+        s["deposits_total"] = round(s["deposits_total"] + amount, 2)
+        snapshot = dict(s)
+    _persist_stats(user_id, snapshot)
+
+
+def record_withdrawal(user_id, amount):
+    """Adds a submitted withdrawal's USD amount into lifetime stats (for
+    the Withdrawals card on /stats)."""
+    with STATS_LOCK:
+        s = user_stats.get(user_id)
+        if s is None:
+            s = _new_stats_entry(None)
+            user_stats[user_id] = s
+        s["withdrawals_total"] = round(s["withdrawals_total"] + amount, 2)
+        snapshot = dict(s)
+    _persist_stats(user_id, snapshot)
+
+
+def mark_user_joined(user_id, username=None):
+    """Called the first time a user is ever seen, so /stats has a real
+    join date to show. A no-op if we already have a stats entry for them
+    (never overwrites an existing joined_at)."""
+    with STATS_LOCK:
+        s = user_stats.get(user_id)
+        if s is not None:
+            return
+        s = _new_stats_entry(username)
+        user_stats[user_id] = s
+        snapshot = dict(s)
+    _persist_stats(user_id, snapshot)
 
 
 def get_user_stats(user_id, username=None):
@@ -770,14 +828,11 @@ def get_user_stats(user_id, username=None):
     with STATS_LOCK:
         s = user_stats.get(user_id)
         if s is None:
-            s = loaded if isinstance(loaded, dict) else {
-                "username": username or "Player",
-                "games_played": 0,
-                "total_wagered": 0.0,
-                "total_won": 0.0,
-                "biggest_win": 0.0,
-                "net_profit": 0.0,
-            }
+            if isinstance(loaded, dict):
+                s = _new_stats_entry(username)
+                s.update(loaded)
+            else:
+                s = _new_stats_entry(username)
             user_stats[user_id] = s
         if username:
             s["username"] = username
@@ -841,109 +896,281 @@ def _load_font(size, bold=False):
     return font
 
 
+def _vip_tier(total_wagered):
+    """Cosmetic VIP tier derived from lifetime wagered volume - purely for
+    the badge on /stats, doesn't affect odds/payouts anywhere."""
+    tiers = [
+        (50000, "DIAMOND", (170, 225, 255)),
+        (10000, "PLATINUM", (210, 215, 230)),
+        (2000,  "GOLD", (255, 197, 61)),
+        (500,   "SILVER", (200, 200, 212)),
+        (0,     "MEMBER", (150, 145, 170)),
+    ]
+    for threshold, label, color in tiers:
+        if total_wagered >= threshold:
+            return label, color
+    return "MEMBER", (150, 145, 170)
+
+
+def _player_level(total_wagered):
+    """Cosmetic level, roughly one level per $250 wagered lifetime."""
+    return max(1, int(total_wagered // 250) + 1)
+
+
+def _rounded_rect_layer(size, box, radius, fill=None, outline=None, width=1):
+    """Draws a rounded rect onto a fresh transparent RGBA layer the size of
+    the full canvas, so it can be alpha-composited (needed for real
+    translucency, which plain ImageDraw-on-RGB can't do correctly)."""
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    d.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+    return layer
+
+
+def _draw_stat_icon(draw, kind, cx, cy, r, color):
+    """Hand-drawn flat vector icon (no emoji-font dependency, so it renders
+    identically on any host) for a given stat card, centered at (cx, cy)."""
+    w = max(2, int(r * 0.16))
+    if kind == "balance":
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=color, width=w)
+        draw.line([(cx, cy - r * 0.55), (cx, cy + r * 0.55)], fill=color, width=w)
+        draw.line([(cx - r * 0.32, cy - r * 0.25), (cx + r * 0.32, cy - r * 0.25)], fill=color, width=max(2, w - 1))
+        draw.line([(cx - r * 0.32, cy + r * 0.25), (cx + r * 0.32, cy + r * 0.25)], fill=color, width=max(2, w - 1))
+    elif kind == "target":
+        for frac in (1.0, 0.6, 0.22):
+            draw.ellipse([cx - r * frac, cy - r * frac, cx + r * frac, cy + r * frac], outline=color, width=w)
+    elif kind == "arrow_up":
+        draw.polygon([(cx, cy - r), (cx + r * 0.85, cy + r * 0.5), (cx - r * 0.85, cy + r * 0.5)], fill=color)
+    elif kind == "arrow_down":
+        draw.polygon([(cx, cy + r), (cx + r * 0.85, cy - r * 0.5), (cx - r * 0.85, cy - r * 0.5)], fill=color)
+    elif kind == "ring_pct":
+        draw.arc([cx - r, cy - r, cx + r, cy + r], start=-90, end=270, fill=(255, 255, 255, 40), width=w)
+        draw.arc([cx - r, cy - r, cx + r, cy + r], start=-90, end=90, fill=color, width=w)
+    elif kind == "dice":
+        s = r * 0.62
+        draw.rounded_rectangle([cx - s - 8, cy - s + 8, cx + s - 8, cy + s + 8], radius=r * 0.22, outline=color, width=w)
+        draw.rounded_rectangle([cx - s + 10, cy - s - 10, cx + s + 10, cy + s - 10], radius=r * 0.22, outline=color, width=w)
+    elif kind == "diamond":
+        draw.polygon([(cx, cy - r), (cx + r * 0.75, cy - r * 0.15), (cx, cy + r), (cx - r * 0.75, cy - r * 0.15)], fill=color)
+        draw.line([(cx - r * 0.75, cy - r * 0.15), (cx + r * 0.75, cy - r * 0.15)], fill=(0, 0, 0, 70), width=2)
+    elif kind == "deposit":
+        draw.line([(cx, cy - r * 0.9), (cx, cy + r * 0.25)], fill=color, width=w)
+        draw.polygon([(cx - r * 0.5, cy - r * 0.05), (cx + r * 0.5, cy - r * 0.05), (cx, cy + r * 0.55)], fill=color)
+        draw.line([(cx - r * 0.85, cy + r * 0.85), (cx + r * 0.85, cy + r * 0.85)], fill=color, width=w)
+    elif kind == "withdraw":
+        draw.line([(cx, cy + r * 0.9), (cx, cy - r * 0.25)], fill=color, width=w)
+        draw.polygon([(cx - r * 0.5, cy + r * 0.05), (cx + r * 0.5, cy + r * 0.05), (cx, cy - r * 0.55)], fill=color)
+        draw.line([(cx - r * 0.85, cy - r * 0.85), (cx + r * 0.85, cy - r * 0.85)], fill=color, width=w)
+    elif kind == "flame":
+        draw.polygon([
+            (cx, cy - r), (cx + r * 0.55, cy - r * 0.1), (cx + r * 0.28, cy + r * 0.15),
+            (cx + r * 0.45, cy + r), (cx, cy + r * 0.55), (cx - r * 0.45, cy + r),
+            (cx - r * 0.28, cy + r * 0.15), (cx - r * 0.55, cy - r * 0.1),
+        ], fill=color)
+    elif kind == "calendar":
+        draw.rounded_rectangle([cx - r, cy - r * 0.7, cx + r, cy + r], radius=r * 0.18, outline=color, width=w)
+        draw.line([(cx - r, cy - r * 0.2), (cx + r, cy - r * 0.2)], fill=color, width=w)
+        draw.line([(cx - r * 0.5, cy - r * 1.05), (cx - r * 0.5, cy - r * 0.6)], fill=color, width=w)
+        draw.line([(cx + r * 0.5, cy - r * 1.05), (cx + r * 0.5, cy - r * 0.6)], fill=color, width=w)
+
+
 def build_stats_card(user_id, username):
-    """Renders a PNG stats card: circular avatar (or initials fallback if
-    the user has no Telegram profile photo / it can't be fetched), their
-    display name, and their lifetime casino stats. Returns the path to the
-    saved PNG, or None if Pillow isn't installed."""
+    """Renders an ultra-premium vertical (9:16) casino profile/stats card:
+    deep matte-black background with soft gold + neon-blue glow, circular
+    avatar, VIP tier badge, level badge, and glassmorphism cards for every
+    lifetime stat. Returns the path to the saved PNG, or None if Pillow
+    isn't installed."""
     if not _PIL_AVAILABLE:
         return None
 
     stats = get_user_stats(user_id, username)
     photo_bytes = get_user_profile_photo_bytes(user_id)
 
-    W, H = 1000, 560
-    TOP = (30, 22, 48)
-    BOTTOM = (12, 9, 22)
+    W, H = 1080, 1920
+    BLACK = (8, 8, 11)
     GOLD = (255, 197, 61)
-    GREEN = (85, 214, 130)
-    RED = (235, 90, 90)
-    MUTED = (168, 163, 189)
-    WHITE = (245, 245, 250)
+    GOLD_SOFT = (214, 168, 74)
+    BLUE_NEON = (70, 140, 255)
+    GREEN = (80, 224, 140)
+    RED = (240, 95, 100)
+    MUTED = (150, 148, 168)
+    WHITE = (247, 246, 250)
+    CARD_BORDER = (255, 255, 255, 26)
+    CARD_FILL = (255, 255, 255, 16)
 
-    img = Image.new("RGB", (W, H), TOP)
-    draw = ImageDraw.Draw(img)
+    # ---- Background: matte black + soft blurred gold/blue glow blobs ----
+    bg = Image.new("RGB", (W, H), BLACK)
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([W * 0.55, -H * 0.08, W * 1.25, H * 0.28], fill=(*BLUE_NEON, 70))
+    gd.ellipse([-W * 0.35, H * 0.62, W * 0.45, H * 1.05], fill=(*GOLD_SOFT, 55))
+    gd.ellipse([W * 0.15, H * 0.35, W * 0.75, H * 0.62], fill=(90, 60, 160, 30))
+    glow = glow.filter(ImageFilter.GaussianBlur(120))
+    bg = Image.alpha_composite(bg.convert("RGBA"), glow)
 
-    # Simple vertical gradient background for a bit of casino-card polish.
+    # Faint vertical vignette so the very top/bottom stay darkest.
+    vign = Image.new("L", (1, H), 0)
     for y in range(H):
-        t = y / H
-        draw.line(
-            [(0, y), (W, y)],
-            fill=tuple(int(TOP[i] + (BOTTOM[i] - TOP[i]) * t) for i in range(3))
-        )
+        d = min(y, H - y) / (H * 0.5)
+        vign.putpixel((0, y), int(60 * (1 - min(d * 1.4, 1))))
+    vign = vign.resize((W, H))
+    dark = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+    bg = Image.composite(dark, bg, vign)
 
-    # Thin gold border around the whole card.
-    draw.rectangle([4, 4, W - 5, H - 5], outline=GOLD, width=3)
+    draw = ImageDraw.Draw(bg)
 
-    # --- Avatar (circular, top-left) ---
-    avatar_size = 180
-    avatar_pos = (50, 50)
+    # ---- Header: avatar, name, VIP badge, level ----
+    avatar_size = 220
+    avatar_cx = W // 2
+    avatar_top = 90
+    avatar_box = (avatar_cx - avatar_size // 2, avatar_top, avatar_cx + avatar_size // 2, avatar_top + avatar_size)
+
     avatar_img = None
     if photo_bytes:
         try:
-            avatar_img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-            avatar_img = avatar_img.resize((avatar_size, avatar_size))
+            avatar_img = Image.open(io.BytesIO(photo_bytes)).convert("RGB").resize((avatar_size, avatar_size))
         except Exception:
             avatar_img = None
     if avatar_img is None:
-        # Fallback: solid circle with the user's first initial.
-        avatar_img = Image.new("RGB", (avatar_size, avatar_size), (55, 48, 82))
+        avatar_img = Image.new("RGB", (avatar_size, avatar_size), (34, 30, 48))
         ad = ImageDraw.Draw(avatar_img)
         initial = (username or "P").strip()[:1].upper() or "P"
-        f = _load_font(90, bold=True)
+        f = _load_font(100, bold=True)
         bbox = ad.textbbox((0, 0), initial, font=f)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         ad.text(((avatar_size - tw) / 2 - bbox[0], (avatar_size - th) / 2 - bbox[1]), initial, font=f, fill=GOLD)
 
     mask = Image.new("L", (avatar_size, avatar_size), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
-    img.paste(avatar_img, avatar_pos, mask)
-    ring_pad = 5
-    draw.ellipse(
-        [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
-         avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
-        outline=GOLD, width=4
-    )
+    bg.paste(avatar_img, avatar_box[:2], mask)
+    for i, wd in enumerate((6, 2)):
+        col = GOLD if i == 0 else (255, 255, 255)
+        pad = -i * 8
+        draw.ellipse([avatar_box[0] - pad, avatar_box[1] - pad, avatar_box[2] + pad, avatar_box[3] + pad], outline=col, width=wd)
 
-    # --- Name / header (right of avatar) ---
-    name_x = avatar_pos[0] + avatar_size + 40
-    font_name = _load_font(44, bold=True)
-    font_sub = _load_font(24)
-    draw.text((name_x, 65), username or "Player", font=font_name, fill=WHITE)
-    draw.text((name_x, 122), "Traqd Casino — Lifetime Stats", font=font_sub, fill=MUTED)
+    name_y = avatar_top + avatar_size + 32
+    font_name = _load_font(52, bold=True)
+    name_text = username or "Player"
+    nb = draw.textbbox((0, 0), name_text, font=font_name)
+    draw.text(((W - (nb[2] - nb[0])) / 2 - nb[0], name_y), name_text, font=font_name, fill=WHITE)
 
-    # --- Divider ---
-    divider_y = 270
-    draw.line([(50, divider_y), (W - 50, divider_y)], fill=(70, 62, 100), width=2)
+    # VIP + Level badge pills, side by side, centered
+    vip_label, vip_color = _vip_tier(stats["total_wagered"])
+    level = _player_level(stats["total_wagered"])
+    font_badge = _load_font(24, bold=True)
+    badge_y = name_y + 78
 
-    # --- Stat rows ---
+    vip_text = f"★ VIP {vip_label}"
+    lvl_text = f"LVL {level}"
+    vip_bb = draw.textbbox((0, 0), vip_text, font=font_badge)
+    lvl_bb = draw.textbbox((0, 0), lvl_text, font=font_badge)
+    pad_x = 26
+    vip_w = (vip_bb[2] - vip_bb[0]) + pad_x * 2
+    lvl_w = (lvl_bb[2] - lvl_bb[0]) + pad_x * 2
+    gap = 16
+    total_w = vip_w + lvl_w + gap
+    start_x = (W - total_w) / 2
+    badge_h = 46
+
+    vip_box = [start_x, badge_y, start_x + vip_w, badge_y + badge_h]
+    lvl_box = [start_x + vip_w + gap, badge_y, start_x + vip_w + gap + lvl_w, badge_y + badge_h]
+
+    pill = _rounded_rect_layer((W, H), vip_box, radius=badge_h / 2, fill=(*vip_color, 30), outline=(*vip_color, 220), width=2)
+    bg = Image.alpha_composite(bg, pill)
+    pill2 = _rounded_rect_layer((W, H), lvl_box, radius=badge_h / 2, fill=(255, 255, 255, 18), outline=(255, 255, 255, 90), width=2)
+    bg = Image.alpha_composite(bg, pill2)
+    draw = ImageDraw.Draw(bg)
+    draw.text((vip_box[0] + pad_x, vip_box[1] + (badge_h - (vip_bb[3] - vip_bb[1])) / 2 - vip_bb[1]), vip_text, font=font_badge, fill=vip_color)
+    draw.text((lvl_box[0] + pad_x, lvl_box[1] + (badge_h - (lvl_bb[3] - lvl_bb[1])) / 2 - lvl_bb[1]), lvl_text, font=font_badge, fill=WHITE)
+
+    # ---- Glass stat cards ----
     net_profit = stats["net_profit"]
     profit_color = GREEN if net_profit >= 0 else RED
     profit_sign = "+" if net_profit >= 0 else "-"
+    win_rate = (stats["wins_count"] / stats["games_played"] * 100) if stats["games_played"] > 0 else 0.0
+    balance = get_balance(user_id)
+    joined_str = time.strftime("%d %b %Y", time.localtime(stats.get("joined_at", time.time())))
+    streak_type = stats.get("streak_type")
+    streak_n = stats.get("current_streak", 0)
+    streak_str = f"{streak_n} {'Win' if streak_type == 'win' else 'Loss'}{'es' if streak_n != 1 and streak_type != 'win' else ('s' if streak_n != 1 else '')}" if streak_type else "—"
 
-    rows = [
-        ("Games Played", f"{stats['games_played']:,}", WHITE),
-        ("Total Wagered", f"${stats['total_wagered']:,.2f}", WHITE),
-        ("Total Won", f"${stats['total_won']:,.2f}", WHITE),
-        ("Biggest Win", f"${stats['biggest_win']:,.2f}", GOLD),
-        ("Net Profit", f"{profit_sign}${abs(net_profit):,.2f}", profit_color),
+    cards = [
+        ("balance", "Balance", f"${balance:,.2f}", WHITE),
+        ("target", "Total Wagered", f"${stats['total_wagered']:,.2f}", WHITE),
+        ("arrow_up" if net_profit >= 0 else "arrow_down", "Profit / Loss", f"{profit_sign}${abs(net_profit):,.2f}", profit_color),
+        ("ring_pct", "Win Rate", f"{win_rate:.1f}%", GOLD),
+        ("dice", "Total Bets", f"{stats['games_played']:,}", WHITE),
+        ("diamond", "Biggest Win", f"${stats['biggest_win']:,.2f}", GOLD),
+        ("arrow_down", "Biggest Loss", f"${stats['biggest_loss']:,.2f}", RED),
+        ("deposit", "Deposits", f"${stats['deposits_total']:,.2f}", WHITE),
+        ("withdraw", "Withdrawals", f"${stats['withdrawals_total']:,.2f}", WHITE),
+        ("flame", "Current Streak", streak_str, GOLD if streak_type == "win" else (RED if streak_type == "loss" else MUTED)),
     ]
 
-    font_label = _load_font(28)
-    font_value = _load_font(32, bold=True)
-    col_x_label = 60
-    col_x_value = W - 60
-    y = divider_y + 35
-    row_h = 52
-    for label, value, color in rows:
-        draw.text((col_x_label, y), label, font=font_label, fill=MUTED)
-        vb = draw.textbbox((0, 0), value, font=font_value)
-        vw = vb[2] - vb[0]
-        draw.text((col_x_value - vw, y - 3), value, font=font_value, fill=color)
-        y += row_h
+    margin = 56
+    gap_x = 22
+    col_w = (W - margin * 2 - gap_x) / 2
+    card_h = 168
+    row_gap = 22
+    grid_top = int(badge_y + badge_h + 56)
+
+    font_label = _load_font(25)
+    font_value = _load_font(38, bold=True)
+    icon_r = 30
+
+    for idx, (icon_kind, label, value, color) in enumerate(cards):
+        col = idx % 2
+        row = idx // 2
+        x0 = margin + col * (col_w + gap_x)
+        y0 = grid_top + row * (card_h + row_gap)
+        x1 = x0 + col_w
+        y1 = y0 + card_h
+
+        shadow = _rounded_rect_layer((W, H), [x0, y0 + 10, x1, y1 + 10], radius=28, fill=(0, 0, 0, 120))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(14))
+        bg = Image.alpha_composite(bg, shadow)
+        glass = _rounded_rect_layer((W, H), [x0, y0, x1, y1], radius=28, fill=CARD_FILL, outline=CARD_BORDER, width=2)
+        bg = Image.alpha_composite(bg, glass)
+
+    draw = ImageDraw.Draw(bg)
+    for idx, (icon_kind, label, value, color) in enumerate(cards):
+        col = idx % 2
+        row = idx // 2
+        x0 = margin + col * (col_w + gap_x)
+        y0 = grid_top + row * (card_h + row_gap)
+
+        icon_cx = x0 + 54
+        icon_cy = y0 + 54
+        _draw_stat_icon(draw, icon_kind, icon_cx, icon_cy, icon_r, color)
+
+        draw.text((x0 + 28, y0 + 100), label, font=font_label, fill=MUTED)
+        draw.text((x0 + 28, y0 + 128), value, font=font_value, fill=color)
+
+    # ---- Join Date, full-width card ----
+    jd_row = len(cards) // 2 if len(cards) % 2 == 0 else (len(cards) // 2 + 1)
+    jd_y0 = grid_top + jd_row * (card_h + row_gap)
+    jd_y1 = jd_y0 + card_h
+    jd_x0, jd_x1 = margin, W - margin
+
+    shadow = _rounded_rect_layer((W, H), [jd_x0, jd_y0 + 10, jd_x1, jd_y1 + 10], radius=28, fill=(0, 0, 0, 120))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(14))
+    bg = Image.alpha_composite(bg, shadow)
+    glass = _rounded_rect_layer((W, H), [jd_x0, jd_y0, jd_x1, jd_y1], radius=28, fill=CARD_FILL, outline=CARD_BORDER, width=2)
+    bg = Image.alpha_composite(bg, glass)
+    draw = ImageDraw.Draw(bg)
+    _draw_stat_icon(draw, "calendar", jd_x0 + 54, jd_y0 + 54, icon_r, GOLD)
+    draw.text((jd_x0 + 28, jd_y0 + 100), "Member Since", font=font_label, fill=MUTED)
+    draw.text((jd_x0 + 28, jd_y0 + 128), joined_str, font=font_value, fill=WHITE)
+
+    # ---- Footer brand mark ----
+    footer_y = jd_y1 + 46
+    font_footer = _load_font(22, bold=True)
+    footer_text = "T R A Q D   C A S I N O"
+    fb = draw.textbbox((0, 0), footer_text, font=font_footer)
+    draw.text(((W - (fb[2] - fb[0])) / 2 - fb[0], footer_y), footer_text, font=font_footer, fill=(*GOLD, 200) if False else GOLD_SOFT)
 
     out_path = f"/tmp/stats_{user_id}_{int(time.time() * 1000)}.png"
-    img.save(out_path, format="PNG")
+    bg.convert("RGB").save(out_path, format="PNG")
     return out_path
 
 
@@ -1726,6 +1953,7 @@ def process_withdraw_address(chat_id, user_id, username, text):
         with PAYMENTS_LOCK:
             withdraw_requests[withdraw_id]["status"] = "awaiting_manual_2fa"
             withdraw_requests[withdraw_id]["batch_id"] = detail.get("batch_id")
+        record_withdrawal(user_id, usd_amount)
         send_message(
             chat_id,
             f'<tg-emoji emoji-id="{meta["icon_id"]}">{meta["emoji"]}</tg-emoji> <b>Withdrawal received!</b>\n\n'
@@ -1740,6 +1968,7 @@ def process_withdraw_address(chat_id, user_id, username, text):
     with PAYMENTS_LOCK:
         withdraw_requests[withdraw_id]["status"] = "processing"
         withdraw_requests[withdraw_id]["batch_id"] = detail.get("batch_id")
+    record_withdrawal(user_id, usd_amount)
 
     new_balance = get_balance(user_id)
     send_message(
@@ -1833,6 +2062,7 @@ def handle_deposit_ipn(payload):
         })
 
     adjust_balance(user_id, usd_amount)
+    record_deposit(user_id, usd_amount)
     deposit_wager_total = _apply_deposit_wager_requirement(user_id, usd_amount)
     bonus_amount = _apply_first_deposit_bonus(user_id, usd_amount)
 
@@ -4566,14 +4796,12 @@ def handle_message(message):
     if user_id not in all_known_user_ids:
         with KNOWN_USERS_LOCK:
             all_known_user_ids.add(user_id)
+        mark_user_joined(user_id, message["from"].get("first_name"))
         if DB_ENABLED:
             try:
                 db.touch_user(user_id)
             except Exception as e:
                 print(f"⚠️ Could not record user {user_id}: {e}")
-
-    if check_for_custom_emoji_ids(message):
-        return
 
     if not text.startswith("/"):
         # Not a command - might be a reply to a /deposit or /withdraw prompt
