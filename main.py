@@ -102,6 +102,46 @@ def set_house_balance(amount):
         return _house_balance_cache
 
 
+# ---------------------------------------------------------------------------
+# TELEGRAM UPDATE OFFSET - persisted the same way house_balance is (via
+# bot_settings), so a restart resumes getUpdates from exactly where it left
+# off instead of resetting to None. Without this, any restart that happens
+# between receiving a batch of updates and the next getUpdates call (crash,
+# deploy, OOM, a transient network error caught by the polling loop's
+# `except Exception`) causes Telegram to redeliver that whole unconfirmed
+# batch again on the next run - including any real dice throws in it, which
+# then get misapplied as the result of a brand-new "awaiting_roll" round.
+# ---------------------------------------------------------------------------
+_offset_cache = None
+OFFSET_LOCK = threading.Lock()
+
+
+def get_telegram_offset():
+    global _offset_cache
+    with OFFSET_LOCK:
+        if _offset_cache is None:
+            value = None
+            if DB_ENABLED:
+                try:
+                    value = db.load_setting("telegram_offset")
+                except Exception as e:
+                    print(f"⚠️ Could not load telegram_offset: {e}")
+            _offset_cache = int(value) if value is not None else None
+        return _offset_cache
+
+
+def set_telegram_offset(value):
+    global _offset_cache
+    with OFFSET_LOCK:
+        _offset_cache = int(value)
+        if DB_ENABLED:
+            try:
+                db.save_setting("telegram_offset", _offset_cache)
+            except Exception as e:
+                print(f"⚠️ Could not persist telegram_offset: {e}")
+        return _offset_cache
+
+
 BOT_USERNAME = None
 
 
@@ -7480,7 +7520,7 @@ def main():
         print("⚠️  APP_URL not set - Mini Apps will tell players it's not configured yet.")
 
     fetch_bot_username()
-    offset = None
+    offset = get_telegram_offset()
     while True:
         try:
             params = {"timeout": 30}
@@ -7496,6 +7536,7 @@ def main():
 
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
+                set_telegram_offset(offset)
 
                 def process(update=update):
                     try:
