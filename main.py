@@ -639,31 +639,101 @@ def get_withdrawable_balance(user_id):
         return w["real"]
 
 
+def grant_test_funds(uid, fund_amount):
+    """Adds fund_amount to uid's bonus pool with an unclearable wager
+    requirement (so it - and anything won with it - can never become
+    withdrawable) and schedules it to be wiped after 3 hours. Preserves
+    any pre-existing real bonus wager_required exactly as /testfund does.
+    Used both by the /testfund command and by tipped test-money (so money
+    tipped from someone's test funds stays just as locked-down for the
+    recipient - otherwise tipping would be a loophole to launder test
+    money into real withdrawable balance)."""
+    grant_token = time.time()
+    with WALLET_LOCK:
+        w = _ensure_wallet(uid)
+        existing = test_fund_grants.get(uid)
+        if existing:
+            original_wager_required = existing["original_wager_required"]
+            total_test_amount = round(existing["total_test_amount"] + fund_amount, 2)
+        else:
+            original_wager_required = w["wager_required"]
+            total_test_amount = fund_amount
+
+        w["bonus"] = round(w["bonus"] + fund_amount, 2)
+        w["wager_required"] = 10 ** 9
+        _persist_wallet(uid)
+
+    test_fund_grants[uid] = {
+        "token": grant_token,
+        "original_wager_required": original_wager_required,
+        "total_test_amount": total_test_amount,
+    }
+
+    def _expire_testfund(u, token):
+        time.sleep(TESTFUND_LIFETIME_SECONDS)
+        grant = test_fund_grants.get(u)
+        if not grant or grant["token"] != token:
+            return
+        with WALLET_LOCK:
+            w2 = _ensure_wallet(u)
+            w2["bonus"] = max(0.0, round(w2["bonus"] - grant["total_test_amount"], 2))
+            w2["wager_required"] = grant["original_wager_required"]
+            _persist_wallet(u)
+        test_fund_grants.pop(u, None)
+        try:
+            send_message(u, f"{WARN_EMOJI} Your test funds have expired and been removed.")
+        except Exception:
+            pass
+
+    threading.Thread(target=_expire_testfund, args=(uid, grant_token), daemon=True).start()
+
+
 def process_tip(sender_id, recipient_id, amount):
-    """Moves `amount` from sender's REAL balance (never bonus - bonus can't
-    be tipped) into recipient's real balance. If the sender's own deposit
-    hasn't been fully wagered yet (deposit_wager_required > 0), that
-    "unwagered" status carries over to the recipient for this amount - they
-    now need to wager it 1x before it (or anything won with it) can be
-    withdrawn, same as if they'd deposited it themselves. If the sender's
-    funds were already fully wagered/clean, the tip arrives clean with no
-    new requirement for the recipient. Returns (ok, reason)."""
+    """Moves `amount` from the sender to the recipient. Draws from REAL
+    balance first, then - if that's not enough - from the sender's active
+    /testfund money specifically (never from an ordinary real signup
+    bonus, which stays untippable). Whatever portion came from real money
+    arrives as normal real balance for the recipient (carrying forward the
+    sender's deposit-wager status same as before); whatever portion came
+    from test funds arrives as a fresh, equally-locked test-fund grant for
+    the recipient via grant_test_funds() - so tipped test money is exactly
+    as non-withdrawable and time-limited for the recipient as it was for
+    the sender. Returns (ok, reason)."""
     with WALLET_LOCK:
         sw = _ensure_wallet(sender_id)
-        if amount > sw["real"] + 1e-9:
+        sender_grant = test_fund_grants.get(sender_id)
+        test_available = min(sw["bonus"], sender_grant["total_test_amount"]) if sender_grant else 0.0
+        tippable_total = round(sw["real"] + test_available, 2)
+        if amount > tippable_total + 1e-9:
             return False, "insufficient_real"
 
-        sw["real"] = round(sw["real"] - amount, 2)
+        real_used = min(sw["real"], amount)
+        test_used = round(amount - real_used, 2)
+
+        sw["real"] = round(sw["real"] - real_used, 2)
+        if test_used > 0:
+            sw["bonus"] = round(sw["bonus"] - test_used, 2)
+            sender_grant["total_test_amount"] = round(sender_grant["total_test_amount"] - test_used, 2)
         sender_unwagered = sw["deposit_wager_required"] > 0
         _persist_wallet(sender_id)
 
-        rw = _ensure_wallet(recipient_id)
-        rw["real"] = round(rw["real"] + amount, 2)
-        if sender_unwagered:
-            rw["deposit_wager_required"] = round(rw["deposit_wager_required"] + amount, 2)
-        _persist_wallet(recipient_id)
+        if real_used > 0:
+            rw = _ensure_wallet(recipient_id)
+            rw["real"] = round(rw["real"] + real_used, 2)
+            if sender_unwagered:
+                rw["deposit_wager_required"] = round(rw["deposit_wager_required"] + real_used, 2)
+            _persist_wallet(recipient_id)
 
-        return True, "unwagered" if sender_unwagered else "clean"
+    if test_used > 0:
+        grant_test_funds(recipient_id, test_used)
+
+    if test_used > 0 and real_used > 0:
+        reason = "mixed"
+    elif test_used > 0:
+        reason = "test"
+    else:
+        reason = "unwagered" if sender_unwagered else "clean"
+    return True, reason
 
 # Public HTTPS base URL the bot is reachable at, used to build the Crash
 # Mini App link (Telegram requires an https:// URL for web_app buttons).
@@ -2591,6 +2661,103 @@ def handle_callback(callback_query):
 
     parts = data.split(":")
     action = parts[0]
+
+    if action == "dr_menu":
+        mode = parts[1]
+        cmd = {"oe": "oe", "hl": "hl", "predict": "predict", "1v1": "1v1", "crazy": "crazy"}[mode]
+        pretty = {"oe": "Odd/Even", "hl": "High/Low", "predict": "Prediction", "1v1": "1v1", "crazy": "Crazy Mode"}[mode]
+        answer_callback(callback_id)
+        edit_message(
+            chat_id, message_id,
+            f"{DICEROLL_MODE_EMOJI[mode]} <b>Diceroll {pretty}</b>\n\n"
+            f"Type: <code>/diceroll {cmd} &lt;amount&gt;</code>\n"
+            f"Example: <code>/diceroll {cmd} 10</code>"
+        )
+        return
+
+    if action == "dr_ou":
+        mode, choice, amount_s, owner_id_s = parts[1], parts[2], parts[3], parts[4]
+        _diceroll_confirm_ou(chat_id, message_id, clicking_user_id, callback_id, mode, choice, float(amount_s), int(owner_id_s), username)
+        return
+
+    if action == "dr_pnum":
+        n, amount_s, picks_csv, owner_id_s = int(parts[1]), parts[2], parts[3], parts[4]
+        owner_id = int(owner_id_s)
+        if clicking_user_id != owner_id:
+            answer_callback(callback_id, "🚫 This isn't your bet! Start your own with /diceroll")
+            return
+        selected = [int(x) for x in picks_csv.split(",") if x]
+        if n in selected:
+            selected.remove(n)
+        elif len(selected) < 3:
+            selected.append(n)
+        else:
+            answer_callback(callback_id, "You can only pick up to 3 numbers.", show_alert=True)
+            return
+        answer_callback(callback_id)
+        amount = float(amount_s)
+        edit_message(
+            chat_id, message_id,
+            f"<tg-emoji emoji-id=\"5298736754059138615\">🎯</tg-emoji> <b>Diceroll Prediction</b> — {mention(owner_id, username)}\n\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n\n"
+            f"Pick up to 3 numbers, then hit Confirm:",
+            reply_markup=diceroll_predict_keyboard(amount, owner_id, selected)
+        )
+        return
+
+    if action == "dr_pconfirm":
+        amount_s, picks_csv, owner_id_s = parts[1], parts[2], parts[3]
+        owner_id = int(owner_id_s)
+        if clicking_user_id != owner_id:
+            answer_callback(callback_id, "🚫 This isn't your bet! Start your own with /diceroll")
+            return
+        picks = [int(x) for x in picks_csv.split(",") if x]
+        if not picks:
+            answer_callback(callback_id, "Pick at least one number first!", show_alert=True)
+            return
+        amount = float(amount_s)
+        with DICEROLL_LOCK:
+            if owner_id in user_active_diceroll:
+                answer_callback(callback_id, f"{WARN_EMOJI} You already have an active Diceroll round!", show_alert=True)
+                return
+            balance = get_balance(owner_id)
+            if amount > balance:
+                answer_callback(callback_id, "Insufficient balance!", show_alert=True)
+                edit_message(chat_id, message_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(owner_id, balance)}")
+                return
+            answer_callback(callback_id)
+            adjust_balance(owner_id, -amount)
+            game_id = secrets.token_urlsafe(10)
+            active_diceroll_games[game_id] = {
+                "mode": "predict", "chat_id": chat_id, "user_id": owner_id, "username": username,
+                "amount": amount, "picks": picks, "status": "awaiting_roll",
+            }
+            user_active_diceroll[owner_id] = game_id
+        payout_mult = diceroll_predict_payout(len(picks))
+        picks_str = ", ".join(str(n) for n in sorted(picks))
+        edit_message(
+            chat_id, message_id,
+            f"<tg-emoji emoji-id=\"5298736754059138615\">🎯</tg-emoji> <b>Diceroll Prediction</b> — {mention(owner_id, username)}\n\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> on <b>{picks_str}</b> ({payout_mult:g}x if you hit)\n\n"
+            f"🎲 Send the dice emoji now to roll!"
+        )
+        return
+
+    if action == "dr_duelopp":
+        cflag, amount_s, opponent_type, owner_id_s = parts[1], parts[2], parts[3], parts[4]
+        callback_chat_type = callback_query["message"]["chat"].get("type", "private")
+        _diceroll_confirm_duel_opponent(chat_id, message_id, clicking_user_id, callback_id, callback_chat_type, cflag == "1", float(amount_s), opponent_type, int(owner_id_s), username)
+        return
+
+    if action == "dr_duelfirst":
+        cflag, amount_s, opponent_type, first_to_s, owner_id_s = parts[1], parts[2], parts[3], parts[4], parts[5]
+        _diceroll_confirm_duel(chat_id, message_id, clicking_user_id, callback_id, cflag == "1", float(amount_s), opponent_type, int(first_to_s), int(owner_id_s), username)
+        return
+
+    if action == "dr_join":
+        answer_callback(callback_id)
+        _diceroll_join_open_challenge(chat_id, clicking_user_id, username)
+        return
 
     if action == "curr":
         chosen = parts[1] if len(parts) > 1 else "usd"
@@ -4888,6 +5055,14 @@ def handle_message(message):
     user_id = message["from"]["id"]
     text = message.get("text", "").strip()
 
+    # A physical 🎲 the player threw themselves for an active Diceroll round
+    # (Odd/Even, High/Low, Prediction, 1v1, Crazy Mode) - these carry no
+    # "text" at all, so this has to be checked before anything below that
+    # assumes a text command.
+    if message.get("dice"):
+        try_handle_diceroll_message(chat_id, user_id, message)
+        return
+
     uname = message["from"].get("username")
     if uname:
         key = uname.lower()
@@ -4923,6 +5098,9 @@ def handle_message(message):
         if text and chat_type == "private":
             username = message["from"].get("first_name", "Player")
             try_handle_payment_flow_message(chat_id, user_id, username, text)
+        elif text.lower() == "join" and chat_type in ("group", "supergroup") and chat_id in diceroll_open_challenges:
+            username = message["from"].get("first_name", "Player")
+            _diceroll_join_open_challenge(chat_id, user_id, username)
         return
 
     parts = text.split()
@@ -4941,6 +5119,7 @@ def handle_message(message):
         "/dep": "/deposit",
         "/wd": "/withdraw",
         "/hb": "/housebalance",
+        "/dr": "/diceroll",
     }
     command = COMMAND_ALIASES.get(command, command)
 
@@ -5067,21 +5246,21 @@ def handle_message(message):
                     send_message(
                         chat_id,
                         f"{WARN_EMOJI} This link has expired or was already used. "
-                        "Go back to the group and run /dice again."
+                        "Go back to the group and run /luckyroll again."
                     )
                     return
                 if invite["owner_id"] != user_id:
                     send_message(
                         chat_id,
                         f"🚫 This isn't your bet! Only {mention(invite['owner_id'], invite['owner_name'])} "
-                        f"can use this link. Start your own with /dice &lt;amount&gt;."
+                        f"can use this link. Start your own with /luckyroll &lt;amount&gt;."
                     )
                     return
                 if invite["used"]:
                     send_message(
                         chat_id,
                         f"{WARN_EMOJI} This link was already used for its one round. "
-                        "Go back to the group and run /dice again for a new one."
+                        "Go back to the group and run /luckyroll again for a new one."
                     )
                     return
                 invite["used"] = True
@@ -5190,7 +5369,9 @@ def handle_message(message):
             f"cash out any time\n"
             f"/towers &lt;amount&gt; — climb the tower one level at a time\n"
             f"/keno &lt;amount&gt; — pick numbers, match the draw\n"
-            f"/dice &lt;amount&gt; — roll under/over your target\n"
+            f"/luckyroll &lt;amount&gt; — roll under/over your target\n"
+            f"/diceroll — real 🎲 dice games: Odd/Even, High/Low, Prediction, "
+            f"1v1, Crazy Mode (send /diceroll alone for the full syntax)\n"
             f"/coinflip &lt;amount&gt; &lt;heads|tails&gt; — 50/50, straight up\n"
             f"/limbo &lt;amount&gt; &lt;target&gt; — pick a multiplier, beat it "
             f"or lose\n"
@@ -5280,11 +5461,18 @@ def handle_message(message):
 
         ok, reason = process_tip(user_id, recipient_id, amount)
         if not ok:
-            send_message(chat_id, f"{WARN_EMOJI} Not enough non-bonus balance to tip that much - bonus funds can't be tipped.")
+            send_message(chat_id, f"{WARN_EMOJI} Not enough tippable balance - real money plus any active /testfund, but not an ordinary bonus.")
             return
 
         name = message["from"].get("first_name", "Player")
-        note = " (they'll need to wager it 1x before withdrawing it)" if reason == "unwagered" else ""
+        if reason == "unwagered":
+            note = " (they'll need to wager it 1x before withdrawing it)"
+        elif reason == "test":
+            note = " (test funds - they get it as their own locked, non-withdrawable test money)"
+        elif reason == "mixed":
+            note = " (part real, part test funds - the test portion arrives locked/non-withdrawable for them)"
+        else:
+            note = ""
         send_message(
             chat_id,
             f"🎁 {mention(user_id, name)} tipped {mention(recipient_id, recipient_name)} <b>${amount:.2f}</b>!{note}"
@@ -5350,54 +5538,16 @@ def handle_message(message):
             send_message(chat_id, f"{WARN_EMOJI} Amount must be between $0.01 and ${MAX_TESTFUND:.2f}")
             return
 
-        grant_token = time.time()
-        with WALLET_LOCK:
-            w = _ensure_wallet(user_id)
-            existing = test_fund_grants.get(user_id)
-            if existing:
-                # Extending an already-active grant: keep the ORIGINAL
-                # pre-testfund wager_required we captured the first time,
-                # and accumulate the total amount to claw back at expiry.
-                original_wager_required = existing["original_wager_required"]
-                total_test_amount = round(existing["total_test_amount"] + fund_amount, 2)
-            else:
-                original_wager_required = w["wager_required"]
-                total_test_amount = fund_amount
-
-            w["bonus"] = round(w["bonus"] + fund_amount, 2)
-            w["wager_required"] = 10 ** 9  # effectively unclearable while a grant is active
-            _persist_wallet(user_id)
-
-        test_fund_grants[user_id] = {
-            "token": grant_token,
-            "original_wager_required": original_wager_required,
-            "total_test_amount": total_test_amount,
-        }
-
-        def _expire_testfund(uid, token):
-            time.sleep(TESTFUND_LIFETIME_SECONDS)
-            grant = test_fund_grants.get(uid)
-            if not grant or grant["token"] != token:
-                return  # a newer /testfund grant superseded this one - its own timer handles it
-            with WALLET_LOCK:
-                w2 = _ensure_wallet(uid)
-                w2["bonus"] = max(0.0, round(w2["bonus"] - grant["total_test_amount"], 2))
-                w2["wager_required"] = grant["original_wager_required"]
-                _persist_wallet(uid)
-            test_fund_grants.pop(uid, None)
-            try:
-                send_message(uid, f"{WARN_EMOJI} Your test funds have expired and been removed.")
-            except Exception:
-                pass
-
-        threading.Thread(target=_expire_testfund, args=(user_id, grant_token), daemon=True).start()
+        grant_test_funds(user_id, fund_amount)
 
         send_message(
             chat_id,
             f"🧪 Added <b>${fund_amount:.2f}</b> test funds.\n"
             f"This money (and anything won with it) <b>cannot be withdrawn</b> "
             f"and will be wiped in <b>3 hours</b>. Any real bonus you already "
-            f"had is untouched and will be restored to its normal state then."
+            f"had is untouched and will be restored to its normal state then.\n\n"
+            f"It's also tippable now with /tip - if you tip it to someone, "
+            f"they get it as their own equally-locked, equally time-limited test funds."
         )
         return
 
@@ -5518,10 +5668,16 @@ def handle_message(message):
         handle_chicken_command(chat_id, user_id, username, args, chat_type)
         return
 
-    if command == "/dice":
+    if command == "/luckyroll":
         username = message["from"].get("first_name", "Player")
         chat_type = message["chat"].get("type", "private")
         handle_dice_command(chat_id, user_id, username, args, chat_type)
+        return
+
+    if command == "/diceroll":
+        username = message["from"].get("first_name", "Player")
+        chat_type = message["chat"].get("type", "private")
+        handle_diceroll_command(chat_id, user_id, username, args, chat_type)
         return
 
     if command == "/deposit":
@@ -6211,11 +6367,11 @@ def handle_dice_command(chat_id, user_id, username, args, chat_type="private", p
         amount = pre_resolved_usd_amount
     else:
         if not args:
-            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/dice &lt;amount&gt;</code>\nExample: <code>/dice 10</code> or <code>/dice all</code>")
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/luckyroll &lt;amount&gt;</code>\nExample: <code>/luckyroll 10</code> or <code>/luckyroll all</code>")
             return
         amount, _amt_err = resolve_bet_amount(user_id, args[0])
         if _amt_err == "invalid_number":
-            send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/dice 10</code>")
+            send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/luckyroll 10</code>")
             return
         if _amt_err == "rate_unavailable":
             send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
@@ -6288,6 +6444,779 @@ def handle_dice_command(chat_id, user_id, username, args, chat_type="private", p
         f"(that's when your bet is placed):",
         reply_markup=dice_mini_app_keyboard(token)
     )
+
+
+# =============================================================================
+# DICEROLL — /diceroll (alias /dr). Unlike Luckyroll (server-side provably-fair
+# roll shown in a Mini App), every roll here is a REAL Telegram 🎲 message:
+# the player sends the dice emoji themselves and Telegram animates + picks
+# the value server-side, we just read message["dice"]["value"] off it. Five
+# sub-modes: Odd/Even, High/Low, 1v1 (vs Bot or vs an open challenger),
+# Crazy Mode (same as 1v1 but lowest roll wins), and Prediction (pick up to
+# 3 numbers, win if the roll lands on one of them).
+#
+# House edge convention matches the rest of the file: 1% (see MINES_HOUSE_EDGE,
+# CRASH_HOUSE_EDGE, DICE_HOUSE_EDGE etc). Odd/Even and High/Low are a 50/50
+# split -> (1-0.01)/0.5 = 1.98x. Prediction scales the same way per pick count.
+# 1v1/Crazy payout: winner takes (1-edge) of the combined pot, i.e. 1.98x
+# their own stake - so a vs-Player match leaves the house 1% of the total
+# pot, same edge as everywhere else.
+# =============================================================================
+
+DICEROLL_HOUSE_EDGE = 0.01
+DICEROLL_OU_PAYOUT = round((1 - DICEROLL_HOUSE_EDGE) / 0.5, 2)          # 1.98x
+DICEROLL_DUEL_PAYOUT = round((1 - DICEROLL_HOUSE_EDGE) / 0.5, 2)        # 1.98x of own stake (winner takes ~99% of pot)
+
+def diceroll_predict_payout(picks_count):
+    """Fair odds for guessing `picks_count` numbers out of 6, minus house edge."""
+    prob = picks_count / 6
+    return round((1 - DICEROLL_HOUSE_EDGE) / prob, 2)
+
+DICEROLL_FACES = {1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"}
+
+# Separate bot accounts that throw the "opponent" dice in vs-Bot 1v1/Crazy
+# matches, so it visibly comes from a different account instead of the same
+# bot that's running the match. Set as a comma-separated list of bot tokens
+# in the HELPER_BOT_TOKENS env var on Railway. Until that's configured this
+# quietly falls back to the main bot account so vs-Bot mode still works.
+HELPER_BOT_TOKENS = [t.strip() for t in os.environ.get("HELPER_BOT_TOKENS", "").split(",") if t.strip()]
+
+DICEROLL_LOCK = threading.Lock()
+active_diceroll_games = {}       # game_id -> game dict (all modes)
+user_active_diceroll = {}        # user_id -> game_id (one active Diceroll flow per user, any mode)
+diceroll_open_challenges = {}    # chat_id -> game_id (one open 1v1/Crazy challenge waiting for a joiner, per chat)
+
+
+def send_helper_dice(chat_id):
+    """Throws a real animated Telegram dice from a helper bot account (or the
+    main bot if no helpers are configured yet) and returns the value Telegram
+    rolled (1-6). This is the bot's "throw" in vs-Bot matches."""
+    token = random.choice(HELPER_BOT_TOKENS) if HELPER_BOT_TOKENS else BOT_TOKEN
+    try:
+        resp = SESSION.post(f"https://api.telegram.org/bot{token}/sendDice",
+                             json={"chat_id": chat_id, "emoji": "🎲"}, timeout=15)
+        data = resp.json()
+        if data.get("ok"):
+            return data["result"]["dice"]["value"]
+        print(f"⚠️ Helper dice send failed: {data}")
+    except Exception as e:
+        print(f"⚠️ Helper dice send error: {e}")
+    # Last-resort fallback if the API call itself failed (e.g. bad token) -
+    # a fair server-side roll so the match can still continue.
+    return secrets.randbelow(6) + 1
+
+
+def diceroll_cleanup(game_id):
+    with DICEROLL_LOCK:
+        game = active_diceroll_games.pop(game_id, None)
+        if game:
+            user_active_diceroll.pop(game["user_id"], None)
+            opp_id = game.get("opponent_id")
+            if opp_id:
+                user_active_diceroll.pop(opp_id, None)
+            if diceroll_open_challenges.get(game["chat_id"]) == game_id:
+                diceroll_open_challenges.pop(game["chat_id"], None)
+
+
+DICEROLL_MODE_EMOJI = {
+    "oe": "🔢",
+    "hl": '<tg-emoji emoji-id="5445168089148695372">📊</tg-emoji>',
+    "predict": '<tg-emoji emoji-id="5298736754059138615">🎯</tg-emoji>',
+    "1v1": "⚔️", "crazy": "🌀",
+}
+
+
+def diceroll_menu_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🔢 Odd/Even", "callback_data": "dr_menu:oe"},
+         {"text": "High/Low", "callback_data": "dr_menu:hl", "icon_custom_emoji_id": "5445168089148695372"}],
+        [{"text": "Prediction", "callback_data": "dr_menu:predict", "icon_custom_emoji_id": "5298736754059138615"}],
+        [{"text": "⚔️ 1v1", "callback_data": "dr_menu:1v1"},
+         {"text": "🌀 Crazy Mode", "callback_data": "dr_menu:crazy"}],
+    ]}
+
+
+def handle_diceroll_command(chat_id, user_id, username, args, chat_type="private"):
+    if not args:
+        send_message(
+            chat_id,
+            f"🎲 <b>Diceroll</b> — real Telegram dice, you throw it yourself.\n\n"
+            f"Pick a mode below, then follow the prompts. Every roll here is "
+            f"an actual 🎲 you (and your opponent, in 1v1/Crazy) send in chat "
+            f"— Telegram animates and picks the number, nobody can rig it.\n\n"
+            f"<b>Power-user shortcut</b> — skip the buttons by including your "
+            f"pick in the command:\n"
+            f"<code>/diceroll oe 10 odd</code> · <code>/diceroll hl 10 high</code>\n"
+            f"<code>/diceroll predict 10 1,3,5</code>\n"
+            f"<code>/diceroll 1v1 10 bot 3</code> · <code>/diceroll crazy 10 open 1</code>",
+            reply_markup=diceroll_menu_keyboard()
+        )
+        return
+
+    sub = args[0].lower()
+    rest = args[1:]
+
+    if sub in ("oe", "oddeven"):
+        _diceroll_start_ou(chat_id, user_id, username, rest, mode="oe")
+    elif sub in ("hl", "highlow"):
+        _diceroll_start_ou(chat_id, user_id, username, rest, mode="hl")
+    elif sub in ("predict", "pred"):
+        _diceroll_start_predict(chat_id, user_id, username, rest)
+    elif sub == "1v1":
+        _diceroll_start_duel(chat_id, user_id, username, rest, chat_type, crazy=False)
+    elif sub == "crazy":
+        _diceroll_start_duel(chat_id, user_id, username, rest, chat_type, crazy=True)
+    elif sub == "join":
+        _diceroll_join_open_challenge(chat_id, user_id, username)
+    else:
+        send_message(chat_id, f"{WARN_EMOJI} Unknown mode. Run <code>/diceroll</code> with no arguments to see all modes.")
+
+
+# --- Odd/Even and High/Low --------------------------------------------------
+# Amount is typed (same convention as Mines/Towers/Keno - free-form numbers
+# don't work as buttons), the actual pick is two inline buttons. Balance is
+# only checked here, not deducted - the callback below re-checks and deducts
+# at click time, same pattern as mn_bombs for Mines.
+
+def _diceroll_start_ou(chat_id, user_id, username, args, mode):
+    cmd = "oe" if mode == "oe" else "hl"
+    if not args:
+        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/diceroll {cmd} &lt;amount&gt;</code>\nExample: <code>/diceroll {cmd} 10</code> or <code>/diceroll {cmd} all</code>")
+        return
+
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
+        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/diceroll {cmd} 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+        return
+
+    if amount < MIN_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
+        return
+    if amount > MAX_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
+        return
+
+    if user_id in user_active_diceroll:
+        send_message(chat_id, f"{WARN_EMOJI} You already have an active Diceroll round! Finish it first.")
+        return
+
+    balance = get_balance(user_id)
+    if amount > balance:
+        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
+        return
+
+    # --- Fast-path: /diceroll oe <amount> odd  (skips the button, locks straight in)
+    if len(args) > 1:
+        choice_raw = args[1].lower()
+        if mode == "oe":
+            aliases = {"odd": "odd", "o": "odd", "even": "even", "e": "even"}
+        else:
+            aliases = {"high": "high", "h": "high", "low": "low", "l": "low"}
+        choice = aliases.get(choice_raw)
+        if not choice:
+            valid = "odd/even" if mode == "oe" else "high/low"
+            send_message(chat_id, f"{WARN_EMOJI} Unknown choice '{args[1]}'. Use {valid}, e.g. <code>/diceroll {cmd} {args[0]} {list(aliases.values())[0]}</code>")
+            return
+        with DICEROLL_LOCK:
+            if user_id in user_active_diceroll:
+                send_message(chat_id, f"{WARN_EMOJI} You already have an active Diceroll round! Finish it first.")
+                return
+            balance = get_balance(user_id)
+            if amount > balance:
+                send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
+                return
+            adjust_balance(user_id, -amount)
+            game_id = secrets.token_urlsafe(10)
+            active_diceroll_games[game_id] = {
+                "mode": mode, "chat_id": chat_id, "user_id": user_id, "username": username,
+                "amount": amount, "choice": choice, "status": "awaiting_roll",
+            }
+            user_active_diceroll[user_id] = game_id
+        pretty = "Odd/Even" if mode == "oe" else "High/Low"
+        send_message(
+            chat_id,
+            f"{DICEROLL_MODE_EMOJI[mode]} <b>Diceroll {pretty}</b> — {mention(user_id, username)}\n\n"
+            f"Bet: <b>{fmt_money(user_id, amount)}</b> on <b>{choice}</b>\n\n"
+            f"🎲 Send the dice emoji now to roll!"
+        )
+        return
+
+    pretty = "Odd/Even" if mode == "oe" else "High/Low"
+    if mode == "oe":
+        buttons = [[
+            {"text": "🔵 Odd (1,3,5)", "callback_data": f"dr_ou:{mode}:odd:{amount}:{user_id}"},
+            {"text": "🟠 Even (2,4,6)", "callback_data": f"dr_ou:{mode}:even:{amount}:{user_id}"},
+        ]]
+    else:
+        buttons = [[
+            {"text": "High (4-6)", "callback_data": f"dr_ou:{mode}:high:{amount}:{user_id}", "icon_custom_emoji_id": "5449683594425410231"},
+            {"text": "Low (1-3)", "callback_data": f"dr_ou:{mode}:low:{amount}:{user_id}", "icon_custom_emoji_id": "5447183459602669338"},
+        ]]
+
+    send_message(
+        chat_id,
+        f"{DICEROLL_MODE_EMOJI[mode]} <b>Diceroll {pretty}</b> — {mention(user_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
+        f"Pick one:",
+        reply_markup={"inline_keyboard": buttons}
+    )
+
+
+def _diceroll_confirm_ou(chat_id, message_id, clicking_user_id, callback_id, mode, choice, amount, owner_id, username):
+    if clicking_user_id != owner_id:
+        answer_callback(callback_id, "🚫 This isn't your bet! Start your own with /diceroll")
+        return
+    with DICEROLL_LOCK:
+        if owner_id in user_active_diceroll:
+            answer_callback(callback_id, f"{WARN_EMOJI} You already have an active Diceroll round!", show_alert=True)
+            return
+        balance = get_balance(owner_id)
+        if amount > balance:
+            answer_callback(callback_id, "Insufficient balance!", show_alert=True)
+            edit_message(chat_id, message_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(owner_id, balance)}")
+            return
+        answer_callback(callback_id)
+        adjust_balance(owner_id, -amount)
+        game_id = secrets.token_urlsafe(10)
+        active_diceroll_games[game_id] = {
+            "mode": mode, "chat_id": chat_id, "user_id": owner_id, "username": username,
+            "amount": amount, "choice": choice, "status": "awaiting_roll",
+        }
+        user_active_diceroll[owner_id] = game_id
+
+    pretty = "Odd/Even" if mode == "oe" else "High/Low"
+    edit_message(
+        chat_id, message_id,
+        f"{DICEROLL_MODE_EMOJI[mode]} <b>Diceroll {pretty}</b> — {mention(owner_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(owner_id, amount)}</b> on <b>{choice}</b>\n\n"
+        f"🎲 Send the dice emoji now to roll!"
+    )
+
+
+def _diceroll_resolve_ou(game, roll):
+    mode, choice = game["mode"], game["choice"]
+    if mode == "oe":
+        actual = "odd" if roll % 2 == 1 else "even"
+    else:
+        actual = "high" if roll >= 4 else "low"
+    win = actual == choice
+    user_id, username, amount = game["user_id"], game["username"], game["amount"]
+    payout = round(amount * DICEROLL_OU_PAYOUT, 2) if win else 0.0
+    record_bet_result(user_id, username, "Diceroll", amount, payout)
+    if win:
+        adjust_balance(user_id, payout)
+        broadcast_win(user_id, username, "Diceroll", amount, payout, detail=f"Called {choice}, rolled {roll}")
+    new_balance = get_balance(user_id)
+    pretty = "Odd/Even" if mode == "oe" else "High/Low"
+    if win:
+        text = (
+            f"{DICEROLL_FACES[roll]} Rolled <b>{roll}</b> ({actual}) — {mention(user_id, username)}\n\n"
+            f'Called <b>{choice}</b> <tg-emoji emoji-id="5424998570539373838">✅</tg-emoji>\n'
+            f"{fmt_money(user_id, amount)} → {fmt_money(user_id, payout)} ({DICEROLL_OU_PAYOUT:g}x)\n\n"
+            f"{cemoji('trophy')} You won <b>{fmt_money(user_id, payout)}</b>!\n"
+            f"{cemoji('money')} Balance: <b>{fmt_money(user_id, new_balance)}</b>"
+        )
+    else:
+        text = (
+            f"{DICEROLL_FACES[roll]} Rolled <b>{roll}</b> ({actual}) — {mention(user_id, username)}\n\n"
+            f'Called <b>{choice}</b> <tg-emoji emoji-id="5028325978175177540">❌</tg-emoji>\n'
+            f"Lost <b>{fmt_money(user_id, amount)}</b>\n"
+            f"{cemoji('money')} Balance: <b>{fmt_money(user_id, new_balance)}</b>"
+        )
+    send_message(game["chat_id"], text)
+
+
+# --- Prediction --------------------------------------------------------------
+
+def _diceroll_start_predict(chat_id, user_id, username, args):
+    if not args:
+        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/diceroll predict &lt;amount&gt;</code>\nExample: <code>/diceroll predict 10</code> or <code>/diceroll predict all</code>")
+        return
+
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
+        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/diceroll predict 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+        return
+
+    if amount < MIN_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
+        return
+    if amount > MAX_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
+        return
+
+    if user_id in user_active_diceroll:
+        send_message(chat_id, f"{WARN_EMOJI} You already have an active Diceroll round! Finish it first.")
+        return
+
+    balance = get_balance(user_id)
+    if amount > balance:
+        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
+        return
+
+    # --- Fast-path: /diceroll predict <amount> 1,3,5  (skips the number-pick
+    # buttons, locks straight in). Accepts comma-separated in one arg or
+    # space-separated across multiple args.
+    if len(args) > 1:
+        raw_nums = " ".join(args[1:]).replace(",", " ").split()
+        try:
+            picks = sorted({int(n) for n in raw_nums})
+        except ValueError:
+            send_message(chat_id, f"{WARN_EMOJI} Numbers must be 1-6, e.g. <code>/diceroll predict {args[0]} 1,3,5</code>")
+            return
+        if not picks or any(n < 1 or n > 6 for n in picks) or len(picks) > 3:
+            send_message(chat_id, f"{WARN_EMOJI} Pick 1-3 unique numbers between 1 and 6, e.g. <code>/diceroll predict {args[0]} 1,3,5</code>")
+            return
+        with DICEROLL_LOCK:
+            if user_id in user_active_diceroll:
+                send_message(chat_id, f"{WARN_EMOJI} You already have an active Diceroll round! Finish it first.")
+                return
+            balance = get_balance(user_id)
+            if amount > balance:
+                send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
+                return
+            adjust_balance(user_id, -amount)
+            game_id = secrets.token_urlsafe(10)
+            active_diceroll_games[game_id] = {
+                "mode": "predict", "chat_id": chat_id, "user_id": user_id, "username": username,
+                "amount": amount, "picks": picks, "status": "awaiting_roll",
+            }
+            user_active_diceroll[user_id] = game_id
+        picks_str = ", ".join(str(n) for n in picks)
+        send_message(
+            chat_id,
+            f"<tg-emoji emoji-id=\"5298736754059138615\">🎯</tg-emoji> <b>Diceroll Prediction</b> — {mention(user_id, username)}\n\n"
+            f"Bet: <b>{fmt_money(user_id, amount)}</b> on <b>{picks_str}</b> ({diceroll_predict_payout(len(picks)):g}x)\n\n"
+            f"🎲 Send the dice emoji now to roll!"
+        )
+        return
+
+    send_message(
+        chat_id,
+        f"<tg-emoji emoji-id=\"5298736754059138615\">🎯</tg-emoji> <b>Diceroll Prediction</b> — {mention(user_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
+        f"Pick up to 3 numbers, then hit Confirm:",
+        reply_markup=diceroll_predict_keyboard(amount, user_id, [])
+    )
+
+
+def diceroll_predict_keyboard(amount, user_id, selected):
+    picks_csv = ",".join(str(n) for n in selected)
+    row1, row2 = [], []
+    for n in range(1, 7):
+        btn = {"text": f"{DICEROLL_FACES[n]} {n}", "callback_data": f"dr_pnum:{n}:{amount}:{picks_csv}:{user_id}"}
+        if n in selected:
+            btn["icon_custom_emoji_id"] = "5424998570539373838"
+        (row1 if n <= 3 else row2).append(btn)
+    rows = [row1, row2]
+    if selected:
+        rows.append([{"text": f"Confirm ({diceroll_predict_payout(len(selected)):g}x)", "callback_data": f"dr_pconfirm:{amount}:{picks_csv}:{user_id}", "icon_custom_emoji_id": "5424998570539373838"}])
+    return {"inline_keyboard": rows}
+
+
+def _diceroll_resolve_predict(game, roll):
+    user_id, username, amount, picks = game["user_id"], game["username"], game["amount"], game["picks"]
+    win = roll in picks
+    payout_mult = diceroll_predict_payout(len(picks))
+    payout = round(amount * payout_mult, 2) if win else 0.0
+    record_bet_result(user_id, username, "Diceroll", amount, payout)
+    if win:
+        adjust_balance(user_id, payout)
+        broadcast_win(user_id, username, "Diceroll Prediction", amount, payout, detail=f"Picked {picks}, rolled {roll}")
+    new_balance = get_balance(user_id)
+    picks_str = ", ".join(str(n) for n in sorted(picks))
+    if win:
+        text = (
+            f"{DICEROLL_FACES[roll]} Rolled <b>{roll}</b> — {mention(user_id, username)}\n\n"
+            f'Picked <b>{picks_str}</b> <tg-emoji emoji-id="5424998570539373838">✅</tg-emoji>\n'
+            f"{fmt_money(user_id, amount)} → {fmt_money(user_id, payout)} ({payout_mult:g}x)\n\n"
+            f"{cemoji('trophy')} You won <b>{fmt_money(user_id, payout)}</b>!\n"
+            f"{cemoji('money')} Balance: <b>{fmt_money(user_id, new_balance)}</b>"
+        )
+    else:
+        text = (
+            f"{DICEROLL_FACES[roll]} Rolled <b>{roll}</b> — {mention(user_id, username)}\n\n"
+            f'Picked <b>{picks_str}</b> <tg-emoji emoji-id="5028325978175177540">❌</tg-emoji>\n'
+            f"Lost <b>{fmt_money(user_id, amount)}</b>\n"
+            f"{cemoji('money')} Balance: <b>{fmt_money(user_id, new_balance)}</b>"
+        )
+    send_message(game["chat_id"], text)
+
+
+# --- 1v1 and Crazy Mode (same engine, `crazy` flips who wins each round) ----
+
+def _diceroll_start_duel(chat_id, user_id, username, args, chat_type, crazy):
+    cmd = "crazy" if crazy else "1v1"
+    if not args:
+        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/diceroll {cmd} &lt;amount&gt;</code>\nExample: <code>/diceroll {cmd} 10</code> or <code>/diceroll {cmd} all</code>")
+        return
+
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
+        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/diceroll {cmd} 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+        return
+
+    if amount < MIN_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
+        return
+    if amount > MAX_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
+        return
+
+    if user_id in user_active_diceroll:
+        send_message(chat_id, f"{WARN_EMOJI} You already have an active Diceroll round! Finish it first.")
+        return
+
+    balance = get_balance(user_id)
+    if amount > balance:
+        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
+        return
+
+    # --- Fast-path: /diceroll 1v1 <amount> bot 3  (skips both button steps -
+    # opponent type and first-to - locks straight in)
+    if len(args) > 1:
+        opponent_type = args[1].lower()
+        if opponent_type not in ("bot", "open"):
+            send_message(chat_id, f"{WARN_EMOJI} Opponent must be 'bot' or 'open', e.g. <code>/diceroll {cmd} {args[0]} bot 3</code>")
+            return
+        if opponent_type == "open" and chat_type == "private":
+            send_message(chat_id, f"{WARN_EMOJI} Open challenges only work in a group!")
+            return
+        first_to = 3
+        if len(args) > 2:
+            try:
+                first_to = int(args[2])
+            except ValueError:
+                send_message(chat_id, f"{WARN_EMOJI} First-to must be 1, 2, or 3.")
+                return
+            if first_to not in (1, 2, 3):
+                send_message(chat_id, f"{WARN_EMOJI} First-to must be 1, 2, or 3.")
+                return
+
+        with DICEROLL_LOCK:
+            if user_id in user_active_diceroll:
+                send_message(chat_id, f"{WARN_EMOJI} You already have an active Diceroll round! Finish it first.")
+                return
+            if opponent_type == "open" and chat_id in diceroll_open_challenges:
+                send_message(chat_id, f"{WARN_EMOJI} There's already an open Diceroll challenge in this group.")
+                return
+            balance = get_balance(user_id)
+            if amount > balance:
+                send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
+                return
+            adjust_balance(user_id, -amount)
+            game_id = secrets.token_urlsafe(10)
+            game = {
+                "mode": "crazy" if crazy else "1v1", "chat_id": chat_id, "user_id": user_id, "username": username,
+                "amount": amount, "opponent_type": opponent_type, "opponent_id": None, "opponent_name": None,
+                "first_to": first_to, "score_a": 0, "score_b": 0,
+                "status": "awaiting_join" if opponent_type == "open" else "awaiting_roll",
+            }
+            active_diceroll_games[game_id] = game
+            user_active_diceroll[user_id] = game_id
+            if opponent_type == "open":
+                diceroll_open_challenges[chat_id] = game_id
+
+        pretty = "Crazy Mode (lowest wins)" if crazy else "1v1"
+        if opponent_type == "bot":
+            send_message(
+                chat_id,
+                f"{DICEROLL_MODE_EMOJI['crazy' if crazy else '1v1']} <b>Diceroll {pretty}</b> vs Bot — {mention(user_id, username)}\n\n"
+                f"Bet: <b>{fmt_money(user_id, amount)}</b> · First to <b>{first_to}</b>\n\n"
+                f"🎲 Send the dice emoji now for round 1!"
+            )
+        else:
+            send_message(
+                chat_id,
+                f"{DICEROLL_MODE_EMOJI['crazy' if crazy else '1v1']} <b>Diceroll {pretty}</b> — {mention(user_id, username)} is challenging the group!\n\n"
+                f"Bet: <b>{fmt_money(user_id, amount)}</b> each · First to <b>{first_to}</b>\n\n"
+                f"Tap below to accept (needs the same balance):",
+                reply_markup={"inline_keyboard": [[{"text": "Join Challenge", "callback_data": "dr_join", "icon_custom_emoji_id": "5424998570539373838"}]]}
+            )
+        return
+
+    cflag = "1" if crazy else "0"
+    pretty = "Crazy Mode (lowest wins)" if crazy else "1v1"
+    buttons = [[
+        {"text": "vs Bot", "callback_data": f"dr_duelopp:{cflag}:{amount}:bot:{user_id}", "icon_custom_emoji_id": "5971808079811972376"},
+        {"text": "👥 Open Challenge", "callback_data": f"dr_duelopp:{cflag}:{amount}:open:{user_id}"},
+    ]]
+    send_message(
+        chat_id,
+        f"{DICEROLL_MODE_EMOJI['crazy' if crazy else '1v1']} <b>Diceroll {pretty}</b> — {mention(user_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
+        f"Who's your opponent?",
+        reply_markup={"inline_keyboard": buttons}
+    )
+
+
+def diceroll_first_to_keyboard(cflag, amount, opponent_type, owner_id):
+    return {"inline_keyboard": [[
+        {"text": f"First to {n}", "callback_data": f"dr_duelfirst:{cflag}:{amount}:{opponent_type}:{n}:{owner_id}"}
+        for n in (1, 2, 3)
+    ]]}
+
+
+def _diceroll_confirm_duel_opponent(chat_id, message_id, clicking_user_id, callback_id, chat_type, crazy, amount, opponent_type, owner_id, username):
+    if clicking_user_id != owner_id:
+        answer_callback(callback_id, "🚫 This isn't your bet! Start your own with /diceroll")
+        return
+    if opponent_type == "open" and chat_type == "private":
+        answer_callback(callback_id, "Open challenges only work in a group!", show_alert=True)
+        return
+    answer_callback(callback_id)
+    pretty = "Crazy Mode (lowest wins)" if crazy else "1v1"
+    cflag = "1" if crazy else "0"
+    edit_message(
+        chat_id, message_id,
+        f"{DICEROLL_MODE_EMOJI['crazy' if crazy else '1v1']} <b>Diceroll {pretty}</b> vs "
+        f"{'Bot' if opponent_type == 'bot' else 'Open Challenge'} — {mention(owner_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n\n"
+        f"First to how many wins?",
+        reply_markup=diceroll_first_to_keyboard(cflag, amount, opponent_type, owner_id)
+    )
+
+
+def _diceroll_confirm_duel(chat_id, message_id, clicking_user_id, callback_id, crazy, amount, opponent_type, first_to, owner_id, username):
+    if clicking_user_id != owner_id:
+        answer_callback(callback_id, "🚫 This isn't your bet! Start your own with /diceroll")
+        return
+    with DICEROLL_LOCK:
+        if owner_id in user_active_diceroll:
+            answer_callback(callback_id, f"{WARN_EMOJI} You already have an active Diceroll round!", show_alert=True)
+            return
+        if opponent_type == "open" and chat_id in diceroll_open_challenges:
+            answer_callback(callback_id, f"{WARN_EMOJI} There's already an open Diceroll challenge in this group.", show_alert=True)
+            return
+        balance = get_balance(owner_id)
+        if amount > balance:
+            answer_callback(callback_id, "Insufficient balance!", show_alert=True)
+            edit_message(chat_id, message_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(owner_id, balance)}")
+            return
+        answer_callback(callback_id)
+        adjust_balance(owner_id, -amount)
+        game_id = secrets.token_urlsafe(10)
+        game = {
+            "mode": "crazy" if crazy else "1v1", "chat_id": chat_id, "user_id": owner_id, "username": username,
+            "amount": amount, "opponent_type": opponent_type, "opponent_id": None, "opponent_name": None,
+            "first_to": first_to, "score_a": 0, "score_b": 0,
+            "status": "awaiting_join" if opponent_type == "open" else "awaiting_roll",
+        }
+        active_diceroll_games[game_id] = game
+        user_active_diceroll[owner_id] = game_id
+        if opponent_type == "open":
+            diceroll_open_challenges[chat_id] = game_id
+
+    pretty = "Crazy Mode (lowest wins)" if crazy else "1v1"
+    if opponent_type == "bot":
+        edit_message(
+            chat_id, message_id,
+            f"{DICEROLL_MODE_EMOJI['crazy' if crazy else '1v1']} <b>Diceroll {pretty}</b> vs Bot — {mention(owner_id, username)}\n\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> · First to <b>{first_to}</b>\n\n"
+            f"🎲 Send the dice emoji now for round 1!"
+        )
+    else:
+        edit_message(
+            chat_id, message_id,
+            f"{DICEROLL_MODE_EMOJI['crazy' if crazy else '1v1']} <b>Diceroll {pretty}</b> — {mention(owner_id, username)} is challenging the group!\n\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> each · First to <b>{first_to}</b>\n\n"
+            f"Tap below to accept (needs the same balance):",
+            reply_markup={"inline_keyboard": [[{"text": "Join Challenge", "callback_data": "dr_join", "icon_custom_emoji_id": "5424998570539373838"}]]}
+        )
+
+
+def _diceroll_join_open_challenge(chat_id, user_id, username):
+    with DICEROLL_LOCK:
+        game_id = diceroll_open_challenges.get(chat_id)
+        if not game_id:
+            send_message(chat_id, f"{WARN_EMOJI} No open Diceroll challenge in this group right now.")
+            return
+        game = active_diceroll_games.get(game_id)
+        if not game or game["status"] != "awaiting_join":
+            send_message(chat_id, f"{WARN_EMOJI} That challenge isn't open anymore.")
+            return
+        if user_id == game["user_id"]:
+            send_message(chat_id, f"{WARN_EMOJI} You can't join your own challenge!")
+            return
+        if user_id in user_active_diceroll:
+            send_message(chat_id, f"{WARN_EMOJI} You already have an active Diceroll round! Finish it first.")
+            return
+        amount = game["amount"]
+        balance = get_balance(user_id)
+        if amount > balance:
+            send_message(chat_id, f"{WARN_EMOJI} You need {fmt_money(user_id, amount)} to join. Your balance: {fmt_money(user_id, balance)}")
+            return
+        adjust_balance(user_id, -amount)
+        game["opponent_id"] = user_id
+        game["opponent_name"] = username
+        game["status"] = "awaiting_roll"
+        user_active_diceroll[user_id] = game_id
+        diceroll_open_challenges.pop(chat_id, None)
+
+    pretty = "Crazy Mode (lowest wins)" if game["mode"] == "crazy" else "1v1"
+    emoji = DICEROLL_MODE_EMOJI[game["mode"]]
+    send_message(
+        chat_id,
+        f"{emoji} <b>{mention(user_id, username)}</b> joined the {pretty} challenge vs "
+        f"{mention(game['user_id'], game['username'])}!\n\n"
+        f"{mention(game['user_id'], game['username'])}, send the 🎲 dice emoji for round 1!"
+    )
+
+
+def _diceroll_resolve_duel_round(game, roller_is_a, roll):
+    """One side (a = challenger, b = bot/opponent) just rolled `roll` for the
+    current round. Records it, and if both sides have now rolled this round,
+    settles the round and either starts the next one or ends the match."""
+    if roller_is_a:
+        game["roll_a"] = roll
+    else:
+        game["roll_b"] = roll
+
+    vs_bot = game["opponent_type"] == "bot"
+
+    # vs Bot: the helper dice fires immediately right after the player's
+    # roll, so a round always completes in one message from the player.
+    if vs_bot and "roll_a" in game and "roll_b" not in game:
+        game["roll_b"] = send_helper_dice(game["chat_id"])
+
+    if "roll_a" not in game or "roll_b" not in game:
+        # vs Player: waiting on the other person's roll for this round.
+        next_mention = mention(game["opponent_id"], game["opponent_name"]) if roller_is_a else mention(game["user_id"], game["username"])
+        send_message(game["chat_id"], f"{DICE_EMOJI} Got it! {next_mention}, your turn — send the 🎲 dice emoji.")
+        return
+
+    ra, rb = game["roll_a"], game["roll_b"]
+    crazy = game["mode"] == "crazy"
+    if ra == rb:
+        a_wins_round = None  # tie, reroll
+    else:
+        a_wins_round = (ra < rb) if crazy else (ra > rb)
+
+    game.pop("roll_a", None)
+    game.pop("roll_b", None)
+
+    a_name = mention(game["user_id"], game["username"])
+    b_name = "Helper Bot" if vs_bot else mention(game["opponent_id"], game["opponent_name"])
+
+    if a_wins_round is None:
+        send_message(
+            game["chat_id"],
+            f"{DICEROLL_FACES[ra]} vs {DICEROLL_FACES[rb]} — tie! Reroll this round.\n"
+            f"{a_name}, send the 🎲 dice emoji again."
+        )
+        return
+
+    if a_wins_round:
+        game["score_a"] += 1
+    else:
+        game["score_b"] += 1
+
+    round_line = f"{a_name}: {DICEROLL_FACES[ra]}{ra}  vs  {b_name}: {DICEROLL_FACES[rb]}{rb}"
+    score_line = f"Score: {game['score_a']} - {game['score_b']} (first to {game['first_to']})"
+
+    if game["score_a"] >= game["first_to"] or game["score_b"] >= game["first_to"]:
+        _diceroll_settle_duel(game, round_line, score_line)
+    elif vs_bot:
+        send_message(
+            game["chat_id"],
+            f"{round_line}\n{score_line}\n\n{a_name}, send the 🎲 dice emoji for the next round!"
+        )
+    else:
+        send_message(
+            game["chat_id"],
+            f"{round_line}\n{score_line}\n\n"
+            f"Next round — {a_name} and {b_name}, send your 🎲 dice emoji whenever you're ready."
+        )
+
+
+def _diceroll_settle_duel(game, round_line, score_line):
+    user_id, username, amount = game["user_id"], game["username"], game["amount"]
+    vs_bot = game["opponent_type"] == "bot"
+    a_won = game["score_a"] >= game["first_to"]
+    pretty = "Crazy Mode" if game["mode"] == "crazy" else "1v1"
+
+    payout_a = round(amount * DICEROLL_DUEL_PAYOUT, 2) if a_won else 0.0
+    record_bet_result(user_id, username, f"Diceroll {pretty}", amount, payout_a)
+    if a_won:
+        adjust_balance(user_id, payout_a)
+        broadcast_win(user_id, username, f"Diceroll {pretty}", amount, payout_a, detail=score_line)
+
+    if not vs_bot:
+        opp_id, opp_name = game["opponent_id"], game["opponent_name"]
+        payout_b = round(amount * DICEROLL_DUEL_PAYOUT, 2) if not a_won else 0.0
+        record_bet_result(opp_id, opp_name, f"Diceroll {pretty}", amount, payout_b)
+        if not a_won:
+            adjust_balance(opp_id, payout_b)
+            broadcast_win(opp_id, opp_name, f"Diceroll {pretty}", amount, payout_b, detail=score_line)
+
+    a_name = mention(user_id, username)
+    b_name = "Helper Bot" if vs_bot else mention(game["opponent_id"], game["opponent_name"])
+    winner_name = a_name if a_won else b_name
+
+    text = (
+        f"{round_line}\n{score_line}\n\n"
+        f"{cemoji('trophy')} <b>{winner_name} wins the match!</b>\n\n"
+        f"{a_name} balance: <b>{fmt_money(user_id, get_balance(user_id))}</b>"
+    )
+    if not vs_bot:
+        text += f"\n{b_name} balance: <b>{fmt_money(game['opponent_id'], get_balance(game['opponent_id']))}</b>"
+    send_message(game["chat_id"], text)
+
+    diceroll_cleanup_id = None
+    for gid, g in list(active_diceroll_games.items()):
+        if g is game:
+            diceroll_cleanup_id = gid
+            break
+    if diceroll_cleanup_id:
+        diceroll_cleanup(diceroll_cleanup_id)
+
+
+def try_handle_diceroll_message(chat_id, user_id, message):
+    """Called from handle_message for any incoming message that contains a
+    real Telegram dice throw. Returns True if it belonged to (and was
+    consumed by) an active Diceroll round, False otherwise - so the caller
+    knows whether to keep processing the message as something else."""
+    dice = message.get("dice")
+    if not dice or dice.get("emoji") != "🎲":
+        return False
+
+    with DICEROLL_LOCK:
+        game_id = user_active_diceroll.get(user_id)
+        if not game_id:
+            return False
+        game = active_diceroll_games.get(game_id)
+        if not game or game["chat_id"] != chat_id or game["status"] != "awaiting_roll":
+            return False
+        roller_is_a = None
+        if game["mode"] in ("1v1", "crazy"):
+            if user_id == game["user_id"]:
+                roller_is_a = True
+            elif user_id == game.get("opponent_id"):
+                roller_is_a = False
+            else:
+                return False
+
+    roll = dice["value"]
+
+    if game["mode"] == "oe" or game["mode"] == "hl":
+        diceroll_cleanup(game_id)
+        _diceroll_resolve_ou(game, roll)
+    elif game["mode"] == "predict":
+        diceroll_cleanup(game_id)
+        _diceroll_resolve_predict(game, roll)
+    elif game["mode"] in ("1v1", "crazy"):
+        _diceroll_resolve_duel_round(game, roller_is_a, roll)
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -6455,7 +7384,8 @@ def main():
             {"command": "stats", "description": "Your lifetime casino stats"},
             {"command": "currency", "description": "Set display currency (USD/INR/LTC)"},
             {"command": "blackjack", "description": "Play Blackjack"},
-            {"command": "dice", "description": "Play Dice"},
+            {"command": "luckyroll", "description": "Play Lucky Roll (dice)"},
+            {"command": "diceroll", "description": "Real 🎲 dice games: OE/HL/1v1/Crazy/Predict"},
             {"command": "crash", "description": "Play Crash"},
             {"command": "chickenroad", "description": "Play Chicken Road"},
             {"command": "roulette", "description": "Play Roulette"},
