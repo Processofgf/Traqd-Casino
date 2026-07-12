@@ -5501,16 +5501,16 @@ def handle_message(message):
 
         ok, reason = process_tip(user_id, recipient_id, amount)
         if not ok:
-            send_message(chat_id, f"{WARN_EMOJI} Not enough tippable balance - real money plus any active /testfund, but not an ordinary bonus.")
+            send_message(chat_id, f"{WARN_EMOJI} Not enough tippable balance.")
             return
 
         name = message["from"].get("first_name", "Player")
         if reason == "unwagered":
             note = " (they'll need to wager it 1x before withdrawing it)"
         elif reason == "test":
-            note = " (test funds - they get it as their own locked, non-withdrawable test money)"
+            note = " (arrives as their own locked, non-withdrawable balance)"
         elif reason == "mixed":
-            note = " (part real, part test funds - the test portion arrives locked/non-withdrawable for them)"
+            note = " (part real, part locked - the locked portion isn't withdrawable for them)"
         else:
             note = ""
         send_message(
@@ -7227,6 +7227,24 @@ def try_handle_diceroll_message(chat_id, user_id, message):
     knows whether to keep processing the message as something else."""
     dice = message.get("dice")
     if not dice or dice.get("emoji") != "🎲":
+        return False
+
+    # SECURITY: a forwarded message keeps its original "dice" value intact,
+    # so without this check anyone could save an old high-value 🎲 message
+    # and forward it back in whenever they want a guaranteed result instead
+    # of throwing a fresh one. forward_origin (current Bot API) / the older
+    # forward_date/forward_from/forward_from_chat/forward_sender_name fields
+    # are only ever present on forwarded messages, never on one the user
+    # just sent live - so their presence means this isn't a real live throw.
+    if any(k in message for k in (
+        "forward_origin", "forward_date", "forward_from",
+        "forward_from_chat", "forward_sender_name",
+    )):
+        with DICEROLL_LOCK:
+            game_id = user_active_diceroll.get(user_id)
+            has_active_round = bool(game_id) and active_diceroll_games.get(game_id, {}).get("chat_id") == chat_id
+        if has_active_round:
+            send_message(chat_id, f"{WARN_EMOJI} That's a forwarded dice, not a live throw. Send a fresh 🎲 to roll for real.")
         return False
 
     with DICEROLL_LOCK:
