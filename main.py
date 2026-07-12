@@ -4625,42 +4625,6 @@ def handle_message(message):
         )
         return
 
-    if command == "/walletinfo":
-        # Admin-only diagnostic - deliberately NOT listed in /help or the
-        # command menu. Dumps the raw wallet breakdown so it's possible to
-        # tell whether a withdrawable balance is legitimately real money or
-        # something has leaked in incorrectly, without needing DB access.
-        if not is_admin(user_id):
-            return
-        target_id = user_id
-        if args:
-            try:
-                target_id = int(args[0])
-            except ValueError:
-                send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/walletinfo</code> (yourself) or <code>/walletinfo 123456789</code>")
-                return
-        w = get_wallet_breakdown(target_id)
-        withdrawable = get_withdrawable_balance(target_id)
-        grant = test_fund_grants.get(target_id)
-        grant_line = (
-            f"Active /testfund grant: <b>${grant['total_test_amount']:.2f}</b> "
-            f"(original wager_required was {grant['original_wager_required']:.2f})\n"
-            if grant else "Active /testfund grant: none\n"
-        )
-        send_message(
-            chat_id,
-            f"🔍 <b>Wallet breakdown — {target_id}</b>\n\n"
-            f"real: <b>${w['real']:.2f}</b>\n"
-            f"bonus: <b>${w['bonus']:.2f}</b>\n"
-            f"wager_required: <b>{w['wager_required']:.2f}</b>\n"
-            f"wager_progress: <b>{w['wager_progress']:.2f}</b>\n"
-            f"deposit_wager_required: <b>{w['deposit_wager_required']:.2f}</b>\n"
-            f"deposit_wager_progress: <b>{w.get('deposit_wager_progress', 0):.2f}</b>\n\n"
-            f"{grant_line}\n"
-            f"→ get_withdrawable_balance(): <b>${withdrawable:.2f}</b>"
-        )
-        return
-
     if command == "/seed":
         current_seed = get_client_seed(user_id)
         current_nonce = get_nonce(user_id)
