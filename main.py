@@ -376,15 +376,24 @@ def credit_winnings(user_id, payout, bonus_portion, real_portion, bet_amount):
         _persist_wallet(user_id)
 
 
+_last_bet_split = {}  # user_id -> (bonus_used, real_used, bet_amount) from their last
+                       # adjust_balance(-amount) call, consumed by the very next
+                       # adjust_balance(+payout) call so winnings get credited back
+                       # proportionally to whichever pool funded the bet - critical for
+                       # bonus/test money to actually stay non-withdrawable (see below).
+
+
 def adjust_balance(user_id, delta):
     """Legacy-compatible helper: every existing game calls adjust_balance()
     directly for both the bet deduction (-amount) and the payout (+payout)
     as two separate calls, rather than using spend_for_bet/credit_winnings.
-    To avoid rewriting every single game's flow, this keeps that exact
-    interface working - negative deltas draw bonus-first same as
-    spend_for_bet, positive deltas land in real_balance (simplest correct
-    default once no bonus is active; see credit_winnings() for the
-    bonus-aware path used by newer wager-tracked flows)."""
+    Negative deltas draw bonus-first same as spend_for_bet. Positive deltas
+    used to always land in real_balance regardless of how the bet was
+    funded - that was a real bug: it meant winnings from a bonus-funded (or
+    /testfund-funded) bet became immediately withdrawable, completely
+    bypassing the wagering requirement. Fixed by remembering the bonus/real
+    split from the matching bet (via _last_bet_split) and crediting the
+    payout back in that same proportion, same as credit_winnings() does."""
     with WALLET_LOCK:
         w = _ensure_wallet(user_id)
         if delta < 0:
@@ -393,6 +402,7 @@ def adjust_balance(user_id, delta):
             real_used = amount - bonus_used
             w["bonus"] = round(w["bonus"] - bonus_used, 2)
             w["real"] = round(w["real"] - real_used, 2)
+            _last_bet_split[user_id] = (bonus_used, real_used, amount)
             if w["wager_required"] > 0:
                 w["wager_progress"] = round(w["wager_progress"] + amount, 2)
                 if w["wager_progress"] >= w["wager_required"]:
@@ -404,7 +414,19 @@ def adjust_balance(user_id, delta):
                     w["deposit_wager_required"] = 0.0
                     w["deposit_wager_progress"] = 0.0
         else:
-            w["real"] = round(w["real"] + delta, 2)
+            payout = delta
+            split = _last_bet_split.pop(user_id, None)
+            if split and split[2] > 0:
+                bonus_used, real_used, bet_amount = split
+                bonus_share = bonus_used / bet_amount
+                real_share = real_used / bet_amount
+                w["bonus"] = round(w["bonus"] + payout * bonus_share, 2)
+                w["real"] = round(w["real"] + payout * real_share, 2)
+            else:
+                # No matching bet found (e.g. an admin credit, /testfund
+                # itself, or a refund) - land it in real, the safe default
+                # for money that didn't come from a tracked wager.
+                w["real"] = round(w["real"] + payout, 2)
         _persist_wallet(user_id)
         return round(w["real"] + w["bonus"], 2)
 
@@ -4600,6 +4622,42 @@ def handle_message(message):
             f"This money (and anything won with it) <b>cannot be withdrawn</b> "
             f"and will be wiped in <b>3 hours</b>. Any real bonus you already "
             f"had is untouched and will be restored to its normal state then."
+        )
+        return
+
+    if command == "/walletinfo":
+        # Admin-only diagnostic - deliberately NOT listed in /help or the
+        # command menu. Dumps the raw wallet breakdown so it's possible to
+        # tell whether a withdrawable balance is legitimately real money or
+        # something has leaked in incorrectly, without needing DB access.
+        if not is_admin(user_id):
+            return
+        target_id = user_id
+        if args:
+            try:
+                target_id = int(args[0])
+            except ValueError:
+                send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/walletinfo</code> (yourself) or <code>/walletinfo 123456789</code>")
+                return
+        w = get_wallet_breakdown(target_id)
+        withdrawable = get_withdrawable_balance(target_id)
+        grant = test_fund_grants.get(target_id)
+        grant_line = (
+            f"Active /testfund grant: <b>${grant['total_test_amount']:.2f}</b> "
+            f"(original wager_required was {grant['original_wager_required']:.2f})\n"
+            if grant else "Active /testfund grant: none\n"
+        )
+        send_message(
+            chat_id,
+            f"🔍 <b>Wallet breakdown — {target_id}</b>\n\n"
+            f"real: <b>${w['real']:.2f}</b>\n"
+            f"bonus: <b>${w['bonus']:.2f}</b>\n"
+            f"wager_required: <b>{w['wager_required']:.2f}</b>\n"
+            f"wager_progress: <b>{w['wager_progress']:.2f}</b>\n"
+            f"deposit_wager_required: <b>{w['deposit_wager_required']:.2f}</b>\n"
+            f"deposit_wager_progress: <b>{w.get('deposit_wager_progress', 0):.2f}</b>\n\n"
+            f"{grant_line}\n"
+            f"→ get_withdrawable_balance(): <b>${withdrawable:.2f}</b>"
         )
         return
 
