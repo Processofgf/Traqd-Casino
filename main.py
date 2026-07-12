@@ -8,6 +8,7 @@ import requests
 import json
 import time
 import os
+import sys
 import random
 import secrets
 import hashlib
@@ -17,6 +18,19 @@ import queue
 import math
 import io
 from roulette_stickers import get_sticker_for_number, get_colour
+
+# Railway (and most container hosts) capture stdout as a pipe, not a TTY -
+# Python's print() defaults to fully block-buffering in that case, so log
+# lines can sit in an internal buffer and never actually reach the Railway
+# logs UI until a large-enough chunk builds up (or the process exits). All
+# the "⚠️ ..." diagnostic prints throughout this file are useless for
+# debugging live if that's happening. Forcing line-buffering here makes
+# every print() show up immediately, every time.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -136,7 +150,11 @@ SUPPORTED_CURRENCIES = {
     "inr": {"label": "INR", "emoji": "🇮🇳", "decimals": 2, "icon_id": "5296467211735539812"},
     "ltc": {"label": "LTC", "emoji": "⚪", "decimals": 6, "icon_id": "5080170678729049007"},
 }
-_rate_cache = {"usd_inr": None, "usd_ltc": None, "fetched_at": 0}
+# USD/INR is fixed rather than fetched live - avoids depending on a
+# third-party rate API entirely for INR (that's what was causing the bad
+# cached rates earlier). Update this constant by hand if it needs to move.
+FIXED_USD_INR_RATE = 95.0
+_rate_cache = {"usd_inr": FIXED_USD_INR_RATE, "usd_ltc": None, "fetched_at": 0}
 _RATE_CACHE_TTL = 300  # seconds
 active_crash_games = {}   # token -> game dict
 user_active_crash = {}    # user_id -> token (one live crash round per user)
@@ -323,32 +341,11 @@ def get_wallet_breakdown(user_id):
 
 
 def _fetch_exchange_rates():
-    """Refresh the USD->INR and USD->LTC cached rates. Best-effort - on any
-    failure the stale cached values (or None on first-ever failure) are
-    left in place, so a network hiccup degrades to 'last known rate'
-    rather than breaking the /balance display.
-
-    Also sanity-bounds whatever comes back: a free third-party rate API
-    occasionally returns a malformed/garbage number (wrong field, stale
-    cached response on their end, a units mixup) without erroring out, and
-    that silently propagates into every INR/LTC bet's math afterwards -
-    this is what was causing bets to come out absurdly small/large. USD/INR
-    has stayed within roughly 30-500 for INR's entire history as a
-    convertible currency; anything outside that is rejected as bad data and
-    the previous (still-cached) rate is kept instead."""
-    try:
-        resp = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=8)
-        data = resp.json()
-        rate = data.get("rates", {}).get("INR")
-        if rate:
-            rate = float(rate)
-            if 30 <= rate <= 500:
-                _rate_cache["usd_inr"] = rate
-            else:
-                print(f"⚠️ USD/INR rate {rate} outside sane bounds (30-500) - ignoring, keeping last known rate {_rate_cache['usd_inr']}")
-    except Exception as e:
-        print(f"⚠️ Could not refresh USD/INR rate: {e}")
-
+    """Refresh the USD->LTC cached rate. USD->INR is a fixed constant
+    (FIXED_USD_INR_RATE) now, not fetched - see its definition. Best-effort
+    for LTC - on failure the stale cached value (or None on first-ever
+    failure) is left in place, so a network hiccup degrades to 'last known
+    rate' rather than breaking the /balance display."""
     try:
         resp = requests.get(
             "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd",
@@ -368,20 +365,40 @@ def _fetch_exchange_rates():
     except Exception as e:
         print(f"⚠️ Could not refresh USD/LTC rate: {e}")
 
-    _rate_cache["fetched_at"] = time.time()
+    if _rate_cache["usd_ltc"] is None:
+        # LTC fetch has failed every time so far - retry again in ~30s via
+        # the next background refresh rather than waiting out the full
+        # 5-minute TTL, without blocking every caller in the meantime the
+        # way the cold-start path in _get_rates does for the very first
+        # attempt. (INR no longer needs this - it's a fixed constant.)
+        _rate_cache["fetched_at"] = time.time() - _RATE_CACHE_TTL + 30
+    else:
+        _rate_cache["fetched_at"] = time.time()
 
 
 _rate_refresh_in_flight = threading.Lock()
 
 
 def _get_rates():
-    """Returns the cached rates immediately. If the cache is stale, kicks
-    off a background refresh (rather than blocking this call) and still
-    returns the old-but-serviceable cached value right away - a rate that's
-    a few extra seconds stale is fine, but making whoever happens to trigger
-    the refresh wait up to ~16s for two sequential external HTTP calls is
-    not. `_rate_refresh_in_flight` just prevents piling up duplicate
-    background refreshes if several requests notice the staleness at once."""
+    """Returns the cached rates immediately. If the cache is stale but has
+    at least one successful fetch behind it, kicks off a background refresh
+    and returns the old-but-serviceable cached value right away - a rate
+    that's a few extra seconds stale is fine, but making whoever happens to
+    trigger the refresh wait up to ~16s for two sequential external HTTP
+    calls is not. `_rate_refresh_in_flight` just prevents piling up
+    duplicate background refreshes if several requests notice the
+    staleness at once.
+
+    EXCEPTION: if there has never been a successful fetch yet (fresh
+    deploy/restart, fetched_at is still 0), there's nothing usable to
+    return in the background-refresh case - every INR/LTC bet would hit
+    "rate unavailable" until the 5-minute TTL happened to line up with a
+    background fetch completing. So on that one cold-start case only, this
+    blocks and fetches synchronously (a few seconds, once, ever) instead of
+    surfacing an error to the first person unlucky enough to ask."""
+    if _rate_cache["fetched_at"] == 0:
+        _fetch_exchange_rates()
+        return _rate_cache
     if time.time() - _rate_cache["fetched_at"] > _RATE_CACHE_TTL:
         if _rate_refresh_in_flight.acquire(blocking=False):
             def _refresh():
@@ -421,13 +438,7 @@ def fmt_balance(user_id, usd_amount=None):
     if currency == "usd":
         value = usd_amount
     elif currency == "inr":
-        rates = _get_rates()
-        rate = rates["usd_inr"]
-        if not rate:
-            # Rate unavailable (never fetched successfully) - fall back to
-            # USD rather than showing a wrong/zero number.
-            return f"${usd_amount:.2f} (INR rate unavailable)"
-        value = usd_amount * rate
+        value = usd_amount * FIXED_USD_INR_RATE
     elif currency == "ltc":
         rates = _get_rates()
         rate = rates["usd_ltc"]
@@ -450,15 +461,14 @@ def fmt_money(user_id, usd_amount):
     if currency == "usd":
         return f"${usd_amount:.2f}"
 
-    rates = _get_rates()
-    rate = rates.get("usd_inr") if currency == "inr" else rates.get("usd_ltc")
+    if currency == "inr":
+        return f"₹{usd_amount * FIXED_USD_INR_RATE:,.2f}"
+
+    rate = _get_rates().get("usd_ltc")
     if not rate:
         return f"${usd_amount:.2f}"
 
-    value = usd_amount * rate
-    if currency == "inr":
-        return f"₹{value:,.2f}"
-    return f"{value:.6f} LTC"
+    return f"{usd_amount * rate:.6f} LTC"
 
 
 def resolve_bet_amount(user_id, raw_text):
@@ -480,10 +490,12 @@ def resolve_bet_amount(user_id, raw_text):
     if currency == "usd":
         return round(raw_value, 2), None
 
-    rates = _get_rates()
-    rate = rates.get("usd_inr") if currency == "inr" else rates.get("usd_ltc")
-    if not rate:
-        return None, "rate_unavailable"
+    if currency == "inr":
+        rate = FIXED_USD_INR_RATE
+    else:
+        rate = _get_rates().get("usd_ltc")
+        if not rate:
+            return None, "rate_unavailable"
 
     usd_amount = round(raw_value / rate, 2)
     print(f"💱 resolve_bet_amount: user={user_id} typed={raw_value} {currency} rate={rate} -> ${usd_amount}")
