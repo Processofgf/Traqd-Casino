@@ -15,7 +15,14 @@ import html
 import threading
 import queue
 import math
+import io
 from roulette_stickers import get_sticker_for_number, get_colour
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 try:
     import db as db
@@ -696,6 +703,271 @@ WINS_MIN_PROFIT = float(os.environ.get("WINS_MIN_PROFIT", "1") or 0)
 # can change - there's no way to force the custom art for non-Premium
 # accounts.
 WIN_FEED_EMOJI = '<tg-emoji emoji-id="5190729502069631963">✅</tg-emoji>'
+
+# ---------------------------------------------------------------------------
+# /stats — lifetime per-user gambling stats, backing the /stats image card.
+#
+# record_bet_result() is the single hook every game's settlement path calls
+# once a bet is fully resolved (win, loss, OR push) - regardless of whether
+# that outcome also gets posted to the public wins channel (broadcast_win
+# only fires above WINS_MIN_PROFIT, but stats should count everything).
+# ---------------------------------------------------------------------------
+user_stats = {}   # user_id -> {"username","games_played","total_wagered","total_won","biggest_win","net_profit"}
+STATS_LOCK = threading.Lock()
+
+
+def record_bet_result(user_id, username, game, wagered, payout):
+    """Records one settled bet into the user's lifetime stats. `payout` is
+    0 for a straight loss, the full return (stake back + winnings) for a
+    win, and the stake itself for a push."""
+    profit = round(payout - wagered, 2)
+    with STATS_LOCK:
+        s = user_stats.get(user_id)
+        if s is None:
+            s = {
+                "username": username or "Player",
+                "games_played": 0,
+                "total_wagered": 0.0,
+                "total_won": 0.0,
+                "biggest_win": 0.0,
+                "net_profit": 0.0,
+            }
+            user_stats[user_id] = s
+        if username:
+            s["username"] = username
+        s["games_played"] += 1
+        s["total_wagered"] = round(s["total_wagered"] + wagered, 2)
+        s["total_won"] = round(s["total_won"] + payout, 2)
+        s["net_profit"] = round(s["net_profit"] + profit, 2)
+        if profit > s["biggest_win"]:
+            s["biggest_win"] = profit
+        snapshot = dict(s)
+    if DB_ENABLED:
+        try:
+            db.save_setting(f"stats:{user_id}", json.dumps(snapshot))
+        except Exception as e:
+            print(f"⚠️ Could not persist stats for user {user_id}: {e}")
+
+
+def get_user_stats(user_id, username=None):
+    """Lazily loads a user's stats (from DB if not already cached), and
+    returns a fresh dict - never a live reference - so callers can't
+    accidentally mutate shared state."""
+    with STATS_LOCK:
+        s = user_stats.get(user_id)
+        if s is not None:
+            if username:
+                s["username"] = username
+            return dict(s)
+    loaded = None
+    if DB_ENABLED:
+        try:
+            raw = db.load_setting(f"stats:{user_id}")
+            if raw:
+                loaded = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as e:
+            print(f"⚠️ Could not load stats for user {user_id}: {e}")
+    with STATS_LOCK:
+        s = user_stats.get(user_id)
+        if s is None:
+            s = loaded if isinstance(loaded, dict) else {
+                "username": username or "Player",
+                "games_played": 0,
+                "total_wagered": 0.0,
+                "total_won": 0.0,
+                "biggest_win": 0.0,
+                "net_profit": 0.0,
+            }
+            user_stats[user_id] = s
+        if username:
+            s["username"] = username
+        return dict(s)
+
+
+def get_user_profile_photo_bytes(user_id):
+    """Fetches the user's current Telegram profile photo (biggest available
+    size) as raw bytes, or None if they have no photo / it can't be
+    fetched (private, bot blocked, network hiccup, etc.)."""
+    try:
+        result = api_call("getUserProfilePhotos", user_id=user_id, limit=1)
+        if not result.get("ok"):
+            return None
+        photos = result["result"].get("photos", [])
+        if not photos:
+            return None
+        biggest = photos[0][-1]
+        file_id = biggest["file_id"]
+        file_result = api_call("getFile", file_id=file_id)
+        if not file_result.get("ok"):
+            return None
+        file_path = file_result["result"]["file_path"]
+        resp = SESSION.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}", timeout=15)
+        if resp.status_code == 200:
+            return resp.content
+    except Exception as e:
+        print(f"⚠️ Could not fetch profile photo for user {user_id}: {e}")
+    return None
+
+
+_FONT_CACHE = {}
+
+
+def _load_font(size, bold=False):
+    """Tries a handful of common Linux font paths (DejaVu/Liberation are
+    near-universally present on Debian/Ubuntu hosts, which is what most
+    hosting providers - Railway included - run under), then falls back to
+    Pillow's bundled default font so /stats still renders even on a bare
+    container image with no system fonts installed at all."""
+    key = (size, bold)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    candidates = [
+        f"/usr/share/fonts/truetype/dejavu/DejaVuSans{'-Bold' if bold else ''}.ttf",
+        f"/usr/share/fonts/truetype/liberation/LiberationSans-{'Bold' if bold else 'Regular'}.ttf",
+        f"DejaVuSans{'-Bold' if bold else ''}.ttf",
+    ]
+    for path in candidates:
+        try:
+            font = ImageFont.truetype(path, size)
+            _FONT_CACHE[key] = font
+            return font
+        except Exception:
+            continue
+    try:
+        font = ImageFont.load_default(size=size)
+    except TypeError:
+        font = ImageFont.load_default()
+    _FONT_CACHE[key] = font
+    return font
+
+
+def build_stats_card(user_id, username):
+    """Renders a PNG stats card: circular avatar (or initials fallback if
+    the user has no Telegram profile photo / it can't be fetched), their
+    display name, and their lifetime casino stats. Returns the path to the
+    saved PNG, or None if Pillow isn't installed."""
+    if not _PIL_AVAILABLE:
+        return None
+
+    stats = get_user_stats(user_id, username)
+    photo_bytes = get_user_profile_photo_bytes(user_id)
+
+    W, H = 1000, 560
+    TOP = (30, 22, 48)
+    BOTTOM = (12, 9, 22)
+    GOLD = (255, 197, 61)
+    GREEN = (85, 214, 130)
+    RED = (235, 90, 90)
+    MUTED = (168, 163, 189)
+    WHITE = (245, 245, 250)
+
+    img = Image.new("RGB", (W, H), TOP)
+    draw = ImageDraw.Draw(img)
+
+    # Simple vertical gradient background for a bit of casino-card polish.
+    for y in range(H):
+        t = y / H
+        draw.line(
+            [(0, y), (W, y)],
+            fill=tuple(int(TOP[i] + (BOTTOM[i] - TOP[i]) * t) for i in range(3))
+        )
+
+    # Thin gold border around the whole card.
+    draw.rectangle([4, 4, W - 5, H - 5], outline=GOLD, width=3)
+
+    # --- Avatar (circular, top-left) ---
+    avatar_size = 180
+    avatar_pos = (50, 50)
+    avatar_img = None
+    if photo_bytes:
+        try:
+            avatar_img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+            avatar_img = avatar_img.resize((avatar_size, avatar_size))
+        except Exception:
+            avatar_img = None
+    if avatar_img is None:
+        # Fallback: solid circle with the user's first initial.
+        avatar_img = Image.new("RGB", (avatar_size, avatar_size), (55, 48, 82))
+        ad = ImageDraw.Draw(avatar_img)
+        initial = (username or "P").strip()[:1].upper() or "P"
+        f = _load_font(90, bold=True)
+        bbox = ad.textbbox((0, 0), initial, font=f)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        ad.text(((avatar_size - tw) / 2 - bbox[0], (avatar_size - th) / 2 - bbox[1]), initial, font=f, fill=GOLD)
+
+    mask = Image.new("L", (avatar_size, avatar_size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
+    img.paste(avatar_img, avatar_pos, mask)
+    ring_pad = 5
+    draw.ellipse(
+        [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
+         avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
+        outline=GOLD, width=4
+    )
+
+    # --- Name / header (right of avatar) ---
+    name_x = avatar_pos[0] + avatar_size + 40
+    font_name = _load_font(44, bold=True)
+    font_sub = _load_font(24)
+    draw.text((name_x, 65), username or "Player", font=font_name, fill=WHITE)
+    draw.text((name_x, 122), "Traqd Casino — Lifetime Stats", font=font_sub, fill=MUTED)
+
+    # --- Divider ---
+    divider_y = 270
+    draw.line([(50, divider_y), (W - 50, divider_y)], fill=(70, 62, 100), width=2)
+
+    # --- Stat rows ---
+    net_profit = stats["net_profit"]
+    profit_color = GREEN if net_profit >= 0 else RED
+    profit_sign = "+" if net_profit >= 0 else "-"
+
+    rows = [
+        ("Games Played", f"{stats['games_played']:,}", WHITE),
+        ("Total Wagered", f"${stats['total_wagered']:,.2f}", WHITE),
+        ("Total Won", f"${stats['total_won']:,.2f}", WHITE),
+        ("Biggest Win", f"${stats['biggest_win']:,.2f}", GOLD),
+        ("Net Profit", f"{profit_sign}${abs(net_profit):,.2f}", profit_color),
+    ]
+
+    font_label = _load_font(28)
+    font_value = _load_font(32, bold=True)
+    col_x_label = 60
+    col_x_value = W - 60
+    y = divider_y + 35
+    row_h = 52
+    for label, value, color in rows:
+        draw.text((col_x_label, y), label, font=font_label, fill=MUTED)
+        vb = draw.textbbox((0, 0), value, font=font_value)
+        vw = vb[2] - vb[0]
+        draw.text((col_x_value - vw, y - 3), value, font=font_value, fill=color)
+        y += row_h
+
+    out_path = f"/tmp/stats_{user_id}_{int(time.time() * 1000)}.png"
+    img.save(out_path, format="PNG")
+    return out_path
+
+
+def handle_stats_command(chat_id, user_id, username):
+    if not _PIL_AVAILABLE:
+        send_message(
+            chat_id,
+            f"{WARN_EMOJI} /stats needs the <code>Pillow</code> package installed on the server "
+            "(<code>pip install Pillow</code>) to render the image card."
+        )
+        return
+    card_path = None
+    try:
+        card_path = build_stats_card(user_id, username)
+        send_photo(chat_id, card_path, caption=f"{cemoji('trophy')} <b>{mention(user_id, username)}'s stats</b>")
+    except Exception as e:
+        print(f"⚠️ /stats failed for user {user_id}: {e}")
+        send_message(chat_id, f"{WARN_EMOJI} Couldn't generate your stats card right now, try again shortly.")
+    finally:
+        if card_path:
+            try:
+                os.remove(card_path)
+            except Exception:
+                pass
 
 
 def broadcast_win(user_id, username, game, bet_amount, payout_amount, detail=""):
@@ -2121,6 +2393,7 @@ def handle_callback(callback_query):
 
         if idx in mine_positions:
             answer_callback(callback_id, "💥 BOOM!")
+            record_bet_result(owner_id, username, "Mines", amount, 0.0)
             with MINES_LOCK:
                 active_mines_games.pop(owner_id, None)
 
@@ -2154,6 +2427,7 @@ def handle_callback(callback_query):
             profit = payout - amount
             adjust_balance(owner_id, payout)
             broadcast_win(owner_id, username, "Mines", amount, payout, detail=f"Cleared the board · {bomb_count} mines")
+            record_bet_result(owner_id, username, "Mines", amount, payout)
             with MINES_LOCK:
                 active_mines_games.pop(owner_id, None)
             new_balance = get_balance(owner_id)
@@ -2213,6 +2487,7 @@ def handle_callback(callback_query):
 
         adjust_balance(owner_id, payout)
         broadcast_win(owner_id, username, "Mines", amount, payout, detail=f"Cashed out · {bomb_count} mines, {revealed_count} tiles")
+        record_bet_result(owner_id, username, "Mines", amount, payout)
         with MINES_LOCK:
             active_mines_games.pop(owner_id, None)
 
@@ -2320,6 +2595,7 @@ def handle_callback(callback_query):
         if tile_idx == snake_idx:
             # Hit the snake - game over, bet already deducted at start
             answer_callback(callback_id, "🐍 Snake!")
+            record_bet_result(owner_id, username, "Towers", amount, 0.0)
             game["hit_row"] = current_row
             game["hit_index"] = tile_idx
             with TOWERS_LOCK:
@@ -2351,6 +2627,7 @@ def handle_callback(callback_query):
             profit = payout - amount
             adjust_balance(owner_id, payout)
             broadcast_win(owner_id, username, "Towers", amount, payout, detail=f"Conquered the tower · {label}")
+            record_bet_result(owner_id, username, "Towers", amount, payout)
             game["current_row"] = current_row + 1
             with TOWERS_LOCK:
                 active_towers_games.pop(owner_id, None)
@@ -2404,6 +2681,7 @@ def handle_callback(callback_query):
 
         adjust_balance(owner_id, payout)
         broadcast_win(owner_id, username, "Towers", amount, payout, detail=f"Cashed out · {label}, row {rows_cleared}")
+        record_bet_result(owner_id, username, "Towers", amount, payout)
         with TOWERS_LOCK:
             active_towers_games.pop(owner_id, None)
 
@@ -2550,6 +2828,7 @@ def handle_callback(callback_query):
         multiplier = paytable.get(hits, 0.0)
         payout = amount * multiplier
         profit = payout - amount
+        record_bet_result(owner_id, username, "Keno", amount, payout)
 
         if payout > 0:
             adjust_balance(owner_id, payout)
@@ -2711,6 +2990,7 @@ def handle_callback(callback_query):
         win = check_win(bet_type, bet_value, result_number, result_colour)
         payout_mult = BET_PAYOUTS[bet_type]
         payout = amount * payout_mult if win else 0.0
+        record_bet_result(owner_id, username, "Roulette", amount, payout)
 
         if win:
             adjust_balance(owner_id, payout)
@@ -2836,6 +3116,7 @@ def handle_limbo_command(chat_id, user_id, username, args):
     win = result_multiplier >= target
     potential_payout = amount * target
     payout = potential_payout if win else 0.0
+    record_bet_result(user_id, username, "Limbo", amount, payout)
 
     if win:
         adjust_balance(user_id, payout)
@@ -2948,6 +3229,7 @@ def handle_coinflip_command(chat_id, user_id, username, args):
         win = result == guess
         potential_payout = round(amount * COINFLIP_PAYOUT, 2)
         payout = potential_payout if win else 0.0
+        record_bet_result(user_id, username, "Coinflip", amount, payout)
 
         if win:
             adjust_balance(user_id, payout)
@@ -3467,6 +3749,7 @@ def crash_finalize(token):
         with BALANCE_LOCK:
             pass  # balance already debited at bet time, nothing to do here
         user_active_crash.pop(game["user_id"], None)
+        record_bet_result(game["user_id"], game["username"], "Crash", game["amount"], 0.0)
 
     if should_notify:
         send_message(
@@ -3585,6 +3868,7 @@ def crash_attempt_cashout(token):
 
     adjust_balance(user_id, payout)
     broadcast_win(user_id, username, "Crash", amount, payout, detail=f"Cashed out at {current:.2f}x")
+    record_bet_result(user_id, username, "Crash", amount, payout)
     send_message(
         chat_id,
         f"{CRASH_ROCKET_EMOJI} <b>Crash</b> — {mention(user_id, username)}\n\n"
@@ -4075,6 +4359,7 @@ def _bj_settle(game, user_id, chat_id, username, summary):
     user_active_blackjack.pop(user_id, None)
 
     profit = round(summary["total_payout"] - summary["total_bet"], 2)
+    record_bet_result(user_id, username, "Blackjack", summary["total_bet"], summary["total_payout"])
     lines = [f"{BJ_HEADER_EMOJI} <b>Blackjack</b> — {mention(user_id, username)}", ""]
     dealer_total = bj_hand_value(game["dealer_cards"])
     dealer_str = ", ".join(f"{r}{s}" for r, s in game["dealer_cards"])
@@ -4552,6 +4837,7 @@ def handle_message(message):
             f'<tg-emoji emoji-id="5361775397811795920">📖</tg-emoji> <b>Traqd Casino — Help</b>\n\n'
             f'<b><tg-emoji emoji-id="5215420556089776398">💰</tg-emoji> Wallet</b>\n'
             f"/balance — check your balance\n"
+            f"/stats — your lifetime stats as an image card\n"
             f"/deposit — deposit crypto (min ${MIN_DEPOSIT:.2f})\n"
             f"/withdraw — withdraw crypto (min ${MIN_WITHDRAW:.2f})\n\n"
             f"Your <b>first deposit</b> gets a <b>130% bonus</b> automatically. "
@@ -4599,6 +4885,11 @@ def handle_message(message):
             f"{mention(user_id, name)} balance: <b>${bal:.2f}</b> ({fmt_balance(user_id, bal)})",
             reply_markup=balance_action_keyboard()
         )
+        return
+
+    if command == "/stats":
+        name = message["from"].get("first_name", "Player")
+        handle_stats_command(chat_id, user_id, name)
         return
 
     if command == "/currency":
@@ -5061,6 +5352,7 @@ def chicken_step(token):
         multiplier = game["current_multiplier"]
 
     if hit:
+        record_bet_result(user_id, username, "Chicken Road", amount, 0.0)
         send_message(
             chat_id,
             f"{CHICKEN_HIT_EMOJI} <b>Chicken Road</b> — {mention(user_id, username)}\n\n"
@@ -5074,6 +5366,7 @@ def chicken_step(token):
         payout = round(amount * multiplier, 2)
         adjust_balance(user_id, payout)
         broadcast_win(user_id, username, "Chicken Road", amount, payout, detail=f"Crossed all {CHICKEN_LANES} lanes")
+        record_bet_result(user_id, username, "Chicken Road", amount, payout)
         send_message(
             chat_id,
             f"{CHICKEN_EMOJI} <b>Chicken Road</b> — {mention(user_id, username)}\n\n"
@@ -5118,6 +5411,7 @@ def chicken_cashout(token):
 
     adjust_balance(user_id, payout)
     broadcast_win(user_id, username, "Chicken Road", amount, payout, detail=f"Cashed out after {lane_index} lane{'s' if lane_index != 1 else ''} at {multiplier:.2f}x")
+    record_bet_result(user_id, username, "Chicken Road", amount, payout)
     send_message(
         chat_id,
         f"{CHICKEN_EMOJI} <b>Chicken Road</b> — {mention(user_id, username)}\n\n"
@@ -5428,6 +5722,7 @@ def dice_roll(token, requested_amount=None, requested_direction=None, requested_
         roll = dice_roll_value(game["server_seed"], game["client_seed"], game["nonce"])
         win = (roll < target) if direction == "under" else (roll > target)
         payout = round(amount * multiplier, 2) if win else 0.0
+        record_bet_result(game["user_id"], game["username"], "Dice", amount, payout)
         if win:
             adjust_balance(game["user_id"], payout)
             broadcast_win(game["user_id"], game["username"], "Dice", amount, payout, detail=f"Rolled {roll:.2f}, needed {'under' if direction == 'under' else 'over'} {target:.2f}")
@@ -5817,6 +6112,7 @@ def main():
             {"command": "deposit", "description": "Fund your account (crypto)"},
             {"command": "withdraw", "description": "Withdraw your balance"},
             {"command": "balance", "description": "Check your balance"},
+            {"command": "stats", "description": "Your lifetime casino stats"},
             {"command": "currency", "description": "Set display currency (USD/INR/LTC)"},
             {"command": "blackjack", "description": "Play Blackjack"},
             {"command": "dice", "description": "Play Dice"},
