@@ -43,6 +43,43 @@ def is_admin(user_id):
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DB_ENABLED = False  # flipped to True in main() once db.init()/migrate() succeed
 
+# ---------------------------------------------------------------------------
+# HOUSE BALANCE - a single admin-set number (not derived from anything else,
+# not tied to any real wallet). Purely a manual figure the admin maintains
+# themselves (e.g. to track bankroll) and /housebalance just displays back.
+# Persisted via bot_settings so it survives a restart; falls back to an
+# in-memory-only value if DB isn't configured.
+# ---------------------------------------------------------------------------
+_house_balance_cache = None
+HOUSE_BALANCE_LOCK = threading.Lock()
+
+
+def get_house_balance():
+    global _house_balance_cache
+    with HOUSE_BALANCE_LOCK:
+        if _house_balance_cache is None:
+            value = None
+            if DB_ENABLED:
+                try:
+                    value = db.load_setting("house_balance")
+                except Exception as e:
+                    print(f"⚠️ Could not load house_balance: {e}")
+            _house_balance_cache = float(value) if value is not None else 0.0
+        return _house_balance_cache
+
+
+def set_house_balance(amount):
+    global _house_balance_cache
+    with HOUSE_BALANCE_LOCK:
+        _house_balance_cache = round(float(amount), 2)
+        if DB_ENABLED:
+            try:
+                db.save_setting("house_balance", _house_balance_cache)
+            except Exception as e:
+                print(f"⚠️ Could not persist house_balance: {e}")
+        return _house_balance_cache
+
+
 BOT_USERNAME = None
 
 
@@ -4235,6 +4272,7 @@ def handle_message(message):
         "/cf": "/coinflip",
         "/dep": "/deposit",
         "/wd": "/withdraw",
+        "/hb": "/housebalance",
     }
     command = COMMAND_ALIASES.get(command, command)
 
@@ -4687,6 +4725,36 @@ def handle_message(message):
             f"and will be wiped in <b>3 hours</b>. Any real bonus you already "
             f"had is untouched and will be restored to its normal state then."
         )
+        return
+
+    if command == "/housebalance":
+        # Admin-only, deliberately NOT listed in /help or the command menu.
+        # Just displays back whatever /sethousebalance last set - not
+        # derived from wallets/deposits/anything else, so anyone but an
+        # admin asking for it gets silently ignored rather than a real
+        # (or fake) number.
+        if not is_admin(user_id):
+            return
+        send_message(chat_id, f"🏦 House balance: <b>${get_house_balance():,.2f}</b>")
+        return
+
+    if command == "/sethousebalance":
+        # Admin-only, deliberately NOT listed in /help or the command menu.
+        if not is_admin(user_id):
+            return
+        if not args:
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/sethousebalance 5000</code>")
+            return
+        try:
+            new_amount = round(float(args[0]), 2)
+        except ValueError:
+            send_message(chat_id, f"{WARN_EMOJI} Please give a plain number, e.g. <code>/sethousebalance 5000</code>")
+            return
+        if new_amount < 0:
+            send_message(chat_id, f"{WARN_EMOJI} Amount can't be negative.")
+            return
+        set_house_balance(new_amount)
+        send_message(chat_id, f"✅ House balance set to <b>${new_amount:,.2f}</b>")
         return
 
     if command == "/seed":

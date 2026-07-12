@@ -181,12 +181,36 @@ CREATE TABLE IF NOT EXISTS user_prefs (
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_user_prefs_username ON user_prefs(username);
+
+-- Generic single-value settings store (e.g. the admin-set house balance
+-- shown by /housebalance) - one row per key, nothing fancier needed.
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
 def migrate():
     with _cursor() as cur:
         cur.execute(SCHEMA)
+
+
+def save_setting(key, value):
+    with _cursor() as cur:
+        cur.execute("""
+            INSERT INTO bot_settings (key, value, updated_at)
+            VALUES (%s, %s, now())
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+        """, (key, str(value)))
+
+
+def load_setting(key):
+    with _cursor() as cur:
+        cur.execute("SELECT value FROM bot_settings WHERE key = %s", (key,))
+        row = cur.fetchone()
+        return row["value"] if row else None
 
 
 def load_wallet(user_id):
