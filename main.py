@@ -598,11 +598,17 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
 WINS_CHANNEL_ID = os.environ.get("WINS_CHANNEL_ID", "").strip()
 
 # Minimum payout (profit, not stake back) worth posting - keeps the feed
-# from being spammed with $0.10 dice wins. Override with WINS_MIN_PROFIT.
-WINS_MIN_PROFIT = float(os.environ.get("WINS_MIN_PROFIT", "0") or 0)
+# from being spammed with $0.03 dice wins. Override with WINS_MIN_PROFIT
+# if $1 isn't the right cutoff for your table limits.
+WINS_MIN_PROFIT = float(os.environ.get("WINS_MIN_PROFIT", "1") or 0)
 
 # One custom emoji for every win, regardless of game - keeps the feed
 # looking like a single clean ticker instead of a wall of random icons.
+# NOTE: custom emoji only render as the actual custom graphic for
+# Telegram Premium viewers - everyone else sees the fallback character
+# after it (✅ here). That's a Telegram-side rule, not something a bot
+# can change - there's no way to force the custom art for non-Premium
+# accounts.
 WIN_FEED_EMOJI = '<tg-emoji emoji-id="5258073279305889554">✅</tg-emoji>'
 
 
@@ -620,12 +626,10 @@ def broadcast_win(user_id, username, game, bet_amount, payout_amount, detail="")
         profit = round(payout_amount - bet_amount, 2)
         if profit < WINS_MIN_PROFIT:
             return
-        multiplier_txt = ""
-        if bet_amount > 0:
-            multiplier_txt = f" · {payout_amount / bet_amount:.2f}x"
+        mult = (payout_amount / bet_amount) if bet_amount > 0 else 0.0
         text = (
-            f"{WIN_FEED_EMOJI} {mention(user_id, username)} just won <b>${profit:.2f}</b> "
-            f"on <b>{game}</b>{multiplier_txt}"
+            f"{WIN_FEED_EMOJI} <b>{mention(user_id, username)}</b> won <b>${profit:,.2f}</b> on <b>{game}</b>\n"
+            f"${bet_amount:,.2f} ➜ ${payout_amount:,.2f}  ·  {mult:.2f}x"
         )
         if detail:
             text += f"\n{detail}"
