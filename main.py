@@ -4220,18 +4220,26 @@ def crash_invite_expiry(invite_token):
         active_crash_invites.pop(invite_token, None)
 
 
-def handle_crash_command(chat_id, user_id, username, args, chat_type="private"):
-    if not args:
-        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/crash &lt;amount&gt;</code>\nExample: <code>/crash 10</code>")
-        return
+def handle_crash_command(chat_id, user_id, username, args, chat_type="private", pre_resolved_usd_amount=None):
+    if pre_resolved_usd_amount is not None:
+        # Called from the group-invite DM deep-link: the amount was already
+        # converted to USD once when /crash was typed in the group, so it
+        # must NOT go through resolve_bet_amount again (that would treat it
+        # as a fresh raw input in the user's currency and divide it a
+        # second time, e.g. $12.63 -> $0.83 for an INR user).
+        amount = pre_resolved_usd_amount
+    else:
+        if not args:
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/crash &lt;amount&gt;</code>\nExample: <code>/crash 10</code>")
+            return
 
-    amount, _amt_err = resolve_bet_amount(user_id, args[0])
-    if _amt_err == "invalid_number":
-        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/crash 10</code>")
-        return
-    if _amt_err == "rate_unavailable":
-        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
-        return
+        amount, _amt_err = resolve_bet_amount(user_id, args[0])
+        if _amt_err == "invalid_number":
+            send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/crash 10</code>")
+            return
+        if _amt_err == "rate_unavailable":
+            send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+            return
 
     if amount < MIN_BET:
         send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
@@ -4780,17 +4788,22 @@ def blackjack_pending_expiry(token):
     )
 
 
-def handle_blackjack_command(chat_id, user_id, username, args, chat_type="private"):
-    if not args:
-        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/blackjack &lt;amount&gt;</code>\nExample: <code>/blackjack 10</code>")
-        return
-    amount, _amt_err = resolve_bet_amount(user_id, args[0])
-    if _amt_err == "invalid_number":
-        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/blackjack 10</code>")
-        return
-    if _amt_err == "rate_unavailable":
-        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
-        return
+def handle_blackjack_command(chat_id, user_id, username, args, chat_type="private", pre_resolved_usd_amount=None):
+    if pre_resolved_usd_amount is not None:
+        # Same reasoning as handle_crash_command: this amount already went
+        # through resolve_bet_amount once in the group, so skip it here.
+        amount = pre_resolved_usd_amount
+    else:
+        if not args:
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/blackjack &lt;amount&gt;</code>\nExample: <code>/blackjack 10</code>")
+            return
+        amount, _amt_err = resolve_bet_amount(user_id, args[0])
+        if _amt_err == "invalid_number":
+            send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/blackjack 10</code>")
+            return
+        if _amt_err == "rate_unavailable":
+            send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+            return
     if amount < MIN_BET:
         send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
         return
@@ -4968,7 +4981,7 @@ def handle_message(message):
                 invite["used"] = True
                 amount = invite["amount"]
 
-            handle_crash_command(chat_id, user_id, name, [str(amount)], "private")
+            handle_crash_command(chat_id, user_id, name, [], "private", pre_resolved_usd_amount=amount)
             return
 
         if args and args[0].startswith("bji_"):
@@ -5000,7 +5013,7 @@ def handle_message(message):
                 invite["used"] = True
                 amount = invite["amount"]
 
-            handle_blackjack_command(chat_id, user_id, name, [str(amount)], "private")
+            handle_blackjack_command(chat_id, user_id, name, [], "private", pre_resolved_usd_amount=amount)
             return
 
         if args and args[0].startswith("chi_"):
@@ -5032,7 +5045,7 @@ def handle_message(message):
                 invite["used"] = True
                 amount = invite["amount"]
 
-            handle_chicken_command(chat_id, user_id, name, [str(amount)], "private")
+            handle_chicken_command(chat_id, user_id, name, [], "private", pre_resolved_usd_amount=amount)
             return
 
         if args and args[0].startswith("dri_"):
@@ -5064,7 +5077,7 @@ def handle_message(message):
                 invite["used"] = True
                 amount = invite["amount"]
 
-            handle_dice_command(chat_id, user_id, name, [str(amount)], "private")
+            handle_dice_command(chat_id, user_id, name, [], "private", pre_resolved_usd_amount=amount)
             return
 
         if args and args[0].startswith("depi_"):
@@ -5855,17 +5868,22 @@ def chicken_invite_expiry(invite_token):
         active_chicken_invites.pop(invite_token, None)
 
 
-def handle_chicken_command(chat_id, user_id, username, args, chat_type="private"):
-    if not args:
-        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/chickenroad &lt;amount&gt;</code>\nExample: <code>/chickenroad 10</code>")
-        return
-    amount, _amt_err = resolve_bet_amount(user_id, args[0])
-    if _amt_err == "invalid_number":
-        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/chickenroad 10</code>")
-        return
-    if _amt_err == "rate_unavailable":
-        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
-        return
+def handle_chicken_command(chat_id, user_id, username, args, chat_type="private", pre_resolved_usd_amount=None):
+    if pre_resolved_usd_amount is not None:
+        # Same reasoning as handle_crash_command: this amount already went
+        # through resolve_bet_amount once in the group, so skip it here.
+        amount = pre_resolved_usd_amount
+    else:
+        if not args:
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/chickenroad &lt;amount&gt;</code>\nExample: <code>/chickenroad 10</code>")
+            return
+        amount, _amt_err = resolve_bet_amount(user_id, args[0])
+        if _amt_err == "invalid_number":
+            send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/chickenroad 10</code>")
+            return
+        if _amt_err == "rate_unavailable":
+            send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+            return
     if amount < MIN_BET:
         send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
         return
@@ -6180,17 +6198,22 @@ def dice_invite_expiry(invite_token):
         active_dice_invites.pop(invite_token, None)
 
 
-def handle_dice_command(chat_id, user_id, username, args, chat_type="private"):
-    if not args:
-        send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/dice &lt;amount&gt;</code>\nExample: <code>/dice 10</code>")
-        return
-    amount, _amt_err = resolve_bet_amount(user_id, args[0])
-    if _amt_err == "invalid_number":
-        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/dice 10</code>")
-        return
-    if _amt_err == "rate_unavailable":
-        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
-        return
+def handle_dice_command(chat_id, user_id, username, args, chat_type="private", pre_resolved_usd_amount=None):
+    if pre_resolved_usd_amount is not None:
+        # Same reasoning as handle_crash_command: this amount already went
+        # through resolve_bet_amount once in the group, so skip it here.
+        amount = pre_resolved_usd_amount
+    else:
+        if not args:
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/dice &lt;amount&gt;</code>\nExample: <code>/dice 10</code>")
+            return
+        amount, _amt_err = resolve_bet_amount(user_id, args[0])
+        if _amt_err == "invalid_number":
+            send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/dice 10</code>")
+            return
+        if _amt_err == "rate_unavailable":
+            send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+            return
     if amount < MIN_BET:
         send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
         return
