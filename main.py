@@ -816,14 +816,30 @@ if not APP_URL:
         APP_URL = f"https://{railway_domain}"
 
 
-# Proactively throttle edits per chat so we never trigger Telegram's flood
-# limit in the first place. Reactive retry_after waits (see api_call below)
-# can be 10-15s once flood control actually kicks in - which is what makes
-# the whole chat look frozen when someone taps Mines tiles rapidly, since
-# every tap fires an editMessageText at the same message/chat.
-_last_chat_edit_ts = {}
+# Proactively throttle edits so we never trigger Telegram's flood control in
+# the first place. Reactive retry_after waits (see below) can be 10-15s once
+# flood control actually kicks in - which is what makes the bot look frozen.
+#
+# Two separate limits apply, so we enforce both:
+#   1. PER-MESSAGE: Telegram allows ~1 edit/sec to any single message. This
+#      is what stops one user's own rapid Mines/Towers taps from flooding
+#      their own board.
+#   2. PER-CHAT AGGREGATE: groups also have a much stricter overall budget
+#      (roughly 20 messages/minute TOTAL to the same group, across every
+#      message/user). In a big group (100s of members) with several people
+#      playing at once, each person's edits can individually be well under
+#      1/sec and still blow through this shared group-wide budget - which
+#      is why per-message throttling alone wasn't enough once usage grew.
+#
+# Both are enforced as "reserve a future timestamp, then sleep outside the
+# lock" - never sleep while holding the lock, or one slow reservation ends
+# up blocking every other chat/message too (a bug in an earlier version of
+# this fix).
+_last_edit_ts = {}          # (chat_id, message_id) -> next allowed time
+_last_chat_agg_ts = {}      # chat_id -> next allowed time (aggregate)
 _chat_edit_throttle_lock = threading.Lock()
-MIN_EDIT_INTERVAL = 1.05  # seconds; Telegram allows ~1 edit/sec per chat
+MIN_EDIT_INTERVAL = 1.05        # ~1 edit/sec per message
+CHAT_AGG_MIN_INTERVAL = 3.3     # ~18 edits/min per chat (safely under Telegram's ~20/min group guideline)
 
 
 def api_call(method, **params):
@@ -834,17 +850,17 @@ def api_call(method, **params):
     # Retry a few times, honoring Telegram's own requested wait time.
     if method in ("editMessageText", "editMessageCaption") and "chat_id" in params:
         chat_id = params["chat_id"]
-        # Only hold the lock long enough to reserve this chat's next allowed
-        # slot (a dict read+write, microseconds). The actual sleep happens
-        # AFTER releasing the lock, so a chat that's waiting never blocks
-        # edits for any other chat - that was the bug before: sleeping
-        # while holding a single global lock serialized the WHOLE bot to
-        # ~1 edit/sec instead of just throttling per chat.
+        edit_key = (chat_id, params.get("message_id"))
+        # Only hold the lock long enough to reserve time slots (a couple of
+        # dict read+writes, microseconds). The actual sleep happens AFTER
+        # releasing the lock.
         with _chat_edit_throttle_lock:
             now = time.time()
-            last = _last_chat_edit_ts.get(chat_id, 0)
-            next_allowed = max(now, last + MIN_EDIT_INTERVAL)
-            _last_chat_edit_ts[chat_id] = next_allowed
+            msg_next = max(now, _last_edit_ts.get(edit_key, 0) + MIN_EDIT_INTERVAL)
+            chat_next = max(now, _last_chat_agg_ts.get(chat_id, 0) + CHAT_AGG_MIN_INTERVAL)
+            next_allowed = max(msg_next, chat_next)
+            _last_edit_ts[edit_key] = next_allowed
+            _last_chat_agg_ts[chat_id] = next_allowed
         wait = next_allowed - now
         if wait > 0:
             time.sleep(wait)
