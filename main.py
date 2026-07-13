@@ -157,7 +157,6 @@ def _offset_writer_loop():
     as soon as set_telegram_offset() has something new to persist, writes
     only the latest value (older, already-superseded values in the same
     burst are skipped), then goes back to waiting."""
-    global _offset_dirty
     while True:
         _offset_write_event.wait()
         _offset_write_event.clear()
@@ -659,28 +658,6 @@ _last_bet_split = {}  # user_id -> (bonus_used, real_used, bet_amount) from thei
                        # bonus/test money to actually stay non-withdrawable (see below).
 
 
-def refund_balance(user_id, amount):
-    """Refunds a bet amount back to whichever pool(s) it was deducted from
-    (via the matching _last_bet_split, same proportional logic adjust_balance
-    uses for real wins) WITHOUT counting toward /stats or wagering progress -
-    for admin utilities (like /clearmines) that force-clear a stuck round.
-    If no matching split is found (e.g. a later bet already overwrote it),
-    falls back to refunding straight into real."""
-    with WALLET_LOCK:
-        w = _ensure_wallet(user_id)
-        split = _last_bet_split.pop(user_id, None)
-        if split and abs(split[2] - amount) < 0.01:
-            bonus_used, real_used, bet_amount = split
-            bonus_share = bonus_used / bet_amount
-            real_share = real_used / bet_amount
-            w["bonus"] = round(w["bonus"] + amount * bonus_share, 2)
-            w["real"] = round(w["real"] + amount * real_share, 2)
-        else:
-            w["real"] = round(w["real"] + amount, 2)
-        _persist_wallet(user_id)
-        return round(w["real"] + w["bonus"], 2)
-
-
 def adjust_balance(user_id, delta):
     """Legacy-compatible helper: every existing game calls adjust_balance()
     directly for both the bet deduction (-amount) and the payout (+payout)
@@ -1054,6 +1031,141 @@ def _persist_stats(user_id, snapshot):
             print(f"⚠️ Could not persist stats for user {user_id}: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Rolling 30-day bet log - powers the /stats card's profit-trend chart,
+# win/loss split, and per-game breakdown table. Separate from user_stats
+# above (which is lifetime totals only, no history) since those numbers
+# alone can't reconstruct "last 30 days" or "which game" breakdowns.
+# ---------------------------------------------------------------------------
+user_bet_log = {}   # user_id -> list of {"t": ts, "g": game, "w": wagered, "pf": profit}
+BET_LOG_LOCK = threading.Lock()
+BET_LOG_MAX_AGE_DAYS = 30
+BET_LOG_MAX_ENTRIES = 2000
+
+
+def _persist_bet_log(user_id, log):
+    if DB_ENABLED:
+        try:
+            db.save_setting(f"betlog:{user_id}", json.dumps(log))
+        except Exception as e:
+            print(f"⚠️ Could not persist bet log for user {user_id}: {e}")
+
+
+def _append_bet_log(user_id, game, wagered, profit):
+    now = time.time()
+    cutoff = now - BET_LOG_MAX_AGE_DAYS * 86400
+    with BET_LOG_LOCK:
+        log = user_bet_log.setdefault(user_id, [])
+        log.append({"t": now, "g": game, "w": wagered, "pf": profit})
+        log[:] = [e for e in log if e["t"] >= cutoff][-BET_LOG_MAX_ENTRIES:]
+        snapshot = list(log)
+    _persist_bet_log(user_id, snapshot)
+
+
+def get_user_bet_log(user_id):
+    """Lazily loads a user's rolling ~30-day bet log (from DB if not already
+    cached in memory), already trimmed to the last 30 days."""
+    with BET_LOG_LOCK:
+        log = user_bet_log.get(user_id)
+        if log is not None:
+            return list(log)
+    loaded = []
+    if DB_ENABLED:
+        try:
+            raw = db.load_setting(f"betlog:{user_id}")
+            if raw:
+                loaded = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as e:
+            print(f"⚠️ Could not load bet log for user {user_id}: {e}")
+    cutoff = time.time() - BET_LOG_MAX_AGE_DAYS * 86400
+    loaded = [e for e in loaded if e.get("t", 0) >= cutoff]
+    with BET_LOG_LOCK:
+        log = user_bet_log.setdefault(user_id, loaded)
+    return list(log)
+
+
+def compute_30d_breakdown(user_id):
+    """Aggregates the rolling bet log into everything the /stats card needs:
+    30-day totals, a daily cumulative-PnL series for the chart, and a
+    per-game breakdown (count/win-rate/net PnL)."""
+    now = time.time()
+    cutoff = now - 30 * 86400
+    log = [e for e in get_user_bet_log(user_id) if e.get("t", 0) >= cutoff]
+
+    games_30d = len(log)
+    wagered_30d = sum(e["w"] for e in log)
+    pnl_30d = sum(e["pf"] for e in log)
+    wins_30d = sum(1 for e in log if e["pf"] > 0)
+    losses_30d = sum(1 for e in log if e["pf"] < 0)
+    win_rate_30d = (wins_30d / games_30d * 100) if games_30d else 0.0
+
+    per_game = {}
+    for e in log:
+        pg = per_game.setdefault(e["g"], {"count": 0, "wins": 0, "net_pnl": 0.0})
+        pg["count"] += 1
+        if e["pf"] > 0:
+            pg["wins"] += 1
+        pg["net_pnl"] += e["pf"]
+
+    biggest_win_amt, biggest_win_game = 0.0, None
+    for e in log:
+        if e["pf"] > biggest_win_amt:
+            biggest_win_amt = e["pf"]
+            biggest_win_game = e["g"]
+
+    most_profitable_game, most_profitable_pnl = None, 0.0
+    if per_game:
+        most_profitable_game = max(per_game.items(), key=lambda kv: kv[1]["net_pnl"])[0]
+        most_profitable_pnl = per_game[most_profitable_game]["net_pnl"]
+
+    favourite_game = None
+    if per_game:
+        favourite_game = max(per_game.items(), key=lambda kv: kv[1]["count"])[0]
+
+    avg_bet = (wagered_30d / games_30d) if games_30d else 0.0
+
+    # Daily cumulative PnL series across the last 31 days (index 0 = 30
+    # days ago, index 30 = today) for the profit-trend chart.
+    daily_pnl = [0.0] * 31
+    for e in log:
+        days_ago = max(0, min(30, int((now - e["t"]) // 86400)))
+        daily_pnl[30 - days_ago] += e["pf"]
+    cumulative_pnl_series = []
+    running = 0.0
+    for v in daily_pnl:
+        running += v
+        cumulative_pnl_series.append(running)
+
+    return {
+        "games_30d": games_30d,
+        "wagered_30d": wagered_30d,
+        "pnl_30d": pnl_30d,
+        "wins_30d": wins_30d,
+        "losses_30d": losses_30d,
+        "win_rate_30d": win_rate_30d,
+        "per_game": per_game,
+        "biggest_win_amt": biggest_win_amt,
+        "biggest_win_game": biggest_win_game,
+        "most_profitable_game": most_profitable_game,
+        "most_profitable_pnl": most_profitable_pnl,
+        "favourite_game": favourite_game,
+        "avg_bet": avg_bet,
+        "cumulative_pnl_series": cumulative_pnl_series,
+    }
+
+
+def _compute_rank(user_id):
+    """Approximate leaderboard rank by lifetime wagered volume, among users
+    currently known to this running process (loaded in memory) - not a full
+    DB-wide scan, so it's fast enough to call on every /stats render."""
+    with STATS_LOCK:
+        ranked = sorted(user_stats.items(), key=lambda kv: kv[1].get("total_wagered", 0.0), reverse=True)
+    for i, (uid, _) in enumerate(ranked):
+        if uid == user_id:
+            return i + 1
+    return len(ranked) + 1
+
+
 def record_bet_result(user_id, username, game, wagered, payout):
     """Records one settled bet into the user's lifetime stats. `payout` is
     0 for a straight loss, the full return (stake back + winnings) for a
@@ -1090,6 +1202,7 @@ def record_bet_result(user_id, username, game, wagered, payout):
                 s["current_streak"] = 1
         snapshot = dict(s)
     _persist_stats(user_id, snapshot)
+    _append_bet_log(user_id, game, wagered, profit)
 
 
 def record_deposit(user_id, amount):
@@ -1297,21 +1410,42 @@ def _draw_stat_icon(draw, kind, cx, cy, r, color):
         draw.line([(cx - r, cy - r * 0.2), (cx + r, cy - r * 0.2)], fill=color, width=w)
         draw.line([(cx - r * 0.5, cy - r * 1.05), (cx - r * 0.5, cy - r * 0.6)], fill=color, width=w)
         draw.line([(cx + r * 0.5, cy - r * 1.05), (cx + r * 0.5, cy - r * 0.6)], fill=color, width=w)
+    elif kind == "controller":
+        draw.rounded_rectangle([cx - r, cy - r * 0.5, cx + r, cy + r * 0.5], radius=r * 0.4, outline=color, width=w)
+        draw.line([(cx - r * 0.65, cy - r * 0.05), (cx - r * 0.45, cy - r * 0.05)], fill=color, width=w)
+        draw.line([(cx - r * 0.55, cy - r * 0.15), (cx - r * 0.55, cy + r * 0.05)], fill=color, width=w)
+        draw.ellipse([cx + r * 0.35, cy - r * 0.15, cx + r * 0.5, cy], fill=color)
+        draw.ellipse([cx + r * 0.55, cy + r * 0.05, cx + r * 0.7, cy + r * 0.2], fill=color)
+    elif kind == "trophy":
+        draw.arc([cx - r, cy - r, cx + r, cy + r * 0.3], start=20, end=160, fill=color, width=w)
+        draw.rounded_rectangle([cx - r * 0.5, cy - r * 0.6, cx + r * 0.5, cy + r * 0.3], radius=r * 0.15, outline=color, width=w)
+        draw.line([(cx - r * 0.3, cy + r * 0.3), (cx - r * 0.3, cy + r * 0.7)], fill=color, width=w)
+        draw.line([(cx + r * 0.3, cy + r * 0.3), (cx + r * 0.3, cy + r * 0.7)], fill=color, width=w)
+        draw.line([(cx - r * 0.55, cy + r * 0.7), (cx + r * 0.55, cy + r * 0.7)], fill=color, width=w)
+    elif kind == "cards":
+        draw.rounded_rectangle([cx - r * 0.55 - 8, cy - r * 0.75, cx + r * 0.15 - 8, cy + r * 0.75], radius=r * 0.15, outline=color, width=w)
+        draw.rounded_rectangle([cx - r * 0.15 + 8, cy - r * 0.75, cx + r * 0.55 + 8, cy + r * 0.75], radius=r * 0.15, outline=color, width=w)
+    elif kind == "coins":
+        for dy in (0.35, 0.05, -0.25):
+            draw.ellipse([cx - r * 0.75, cy + r * dy - r * 0.22, cx + r * 0.75, cy + r * dy + r * 0.22], outline=color, width=w)
 
 
-def build_stats_card(user_id, username):
-    """Renders an ultra-premium vertical (9:16) casino profile/stats card:
-    deep matte-black background with soft gold + neon-blue glow, circular
-    avatar, VIP tier badge, level badge, and glassmorphism cards for every
-    lifetime stat. Returns the path to the saved PNG, or None if Pillow
-    isn't installed."""
+def build_stats_card(user_id, username, handle=None):
+    """Renders a 30-day casino stats card: header with avatar/name/handle,
+    ID/tier/rank/streak pills, four KPI boxes (games/wagered/win-rate/PnL),
+    a profit-trend chart + win-loss panel, four highlight boxes, and a
+    per-game breakdown table. Returns the path to the saved PNG, or None if
+    Pillow isn't installed."""
     if not _PIL_AVAILABLE:
         return None
 
     stats = get_user_stats(user_id, username)
+    d30 = compute_30d_breakdown(user_id)
+    rank = _compute_rank(user_id)
     photo_bytes = get_user_profile_photo_bytes(user_id)
+    fmt = lambda v: fmt_money(user_id, v)
 
-    W, H = 1080, 1920
+    W = 1080
     BLACK = (8, 8, 11)
     GOLD = (255, 197, 61)
     GOLD_SOFT = (214, 168, 74)
@@ -1323,33 +1457,24 @@ def build_stats_card(user_id, username):
     CARD_BORDER = (255, 255, 255, 26)
     CARD_FILL = (255, 255, 255, 16)
 
-    # ---- Background: matte black + soft blurred gold/blue glow blobs ----
+    # Generous initial canvas height - cropped to the real content height
+    # at the very end, since the table height varies with game count.
+    H = 1800
+
     bg = Image.new("RGB", (W, H), BLACK)
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
-    gd.ellipse([W * 0.55, -H * 0.08, W * 1.25, H * 0.28], fill=(*BLUE_NEON, 70))
-    gd.ellipse([-W * 0.35, H * 0.62, W * 0.45, H * 1.05], fill=(*GOLD_SOFT, 55))
-    gd.ellipse([W * 0.15, H * 0.35, W * 0.75, H * 0.62], fill=(90, 60, 160, 30))
+    gd.ellipse([W * 0.55, -H * 0.05, W * 1.25, H * 0.18], fill=(*BLUE_NEON, 60))
+    gd.ellipse([-W * 0.35, H * 0.75, W * 0.45, H * 1.05], fill=(*RED, 35))
     glow = glow.filter(ImageFilter.GaussianBlur(120))
     bg = Image.alpha_composite(bg.convert("RGBA"), glow)
-
-    # Faint vertical vignette so the very top/bottom stay darkest.
-    vign = Image.new("L", (1, H), 0)
-    for y in range(H):
-        d = min(y, H - y) / (H * 0.5)
-        vign.putpixel((0, y), int(60 * (1 - min(d * 1.4, 1))))
-    vign = vign.resize((W, H))
-    dark = Image.new("RGBA", (W, H), (0, 0, 0, 255))
-    bg = Image.composite(dark, bg, vign)
-
     draw = ImageDraw.Draw(bg)
 
-    # ---- Header: avatar, name, VIP badge, level ----
-    avatar_size = 220
-    avatar_cx = W // 2
-    avatar_top = 90
-    avatar_box = (avatar_cx - avatar_size // 2, avatar_top, avatar_cx + avatar_size // 2, avatar_top + avatar_size)
+    margin = 56
 
+    # ---- Header: avatar + name/handle (left), brand (right) ----
+    avatar_size = 140
+    avatar_box = (margin, 70, margin + avatar_size, 70 + avatar_size)
     avatar_img = None
     if photo_bytes:
         try:
@@ -1360,146 +1485,305 @@ def build_stats_card(user_id, username):
         avatar_img = Image.new("RGB", (avatar_size, avatar_size), (34, 30, 48))
         ad = ImageDraw.Draw(avatar_img)
         initial = (username or "P").strip()[:1].upper() or "P"
-        f = _load_font(100, bold=True)
+        f = _load_font(64, bold=True)
         bbox = ad.textbbox((0, 0), initial, font=f)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         ad.text(((avatar_size - tw) / 2 - bbox[0], (avatar_size - th) / 2 - bbox[1]), initial, font=f, fill=GOLD)
-
     mask = Image.new("L", (avatar_size, avatar_size), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
     bg.paste(avatar_img, avatar_box[:2], mask)
-    for i, wd in enumerate((6, 2)):
-        col = GOLD if i == 0 else (255, 255, 255)
-        pad = -i * 8
-        draw.ellipse([avatar_box[0] - pad, avatar_box[1] - pad, avatar_box[2] + pad, avatar_box[3] + pad], outline=col, width=wd)
+    draw.ellipse([avatar_box[0] - 4, avatar_box[1] - 4, avatar_box[2] + 4, avatar_box[3] + 4], outline=RED, width=5)
 
-    name_y = avatar_top + avatar_size + 32
-    font_name = _load_font(52, bold=True)
+    name_x = avatar_box[2] + 30
+    font_name = _load_font(46, bold=True)
     name_text = username or "Player"
-    nb = draw.textbbox((0, 0), name_text, font=font_name)
-    draw.text(((W - (nb[2] - nb[0])) / 2 - nb[0], name_y), name_text, font=font_name, fill=WHITE)
+    draw.text((name_x, 78), name_text, font=font_name, fill=WHITE)
+    if handle:
+        font_handle = _load_font(30, bold=True)
+        draw.text((name_x, 132), f"@{handle}", font=font_handle, fill=RED)
 
-    # VIP + Level badge pills, side by side, centered
+    brand = "TRAQD CASINO"
+    font_brand = _load_font(30, bold=True)
+    brand_bb = draw.textbbox((0, 0), brand, font=font_brand)
+    draw.text((W - margin - (brand_bb[2] - brand_bb[0]), 78), brand, font=font_brand, fill=RED)
+    font_tag = _load_font(22)
+    tag = "Play Responsibly"
+    tag_bb = draw.textbbox((0, 0), tag, font=font_tag)
+    draw.text((W - margin - (tag_bb[2] - tag_bb[0]), 118), tag, font=font_tag, fill=MUTED)
+
+    # ---- Pill row: ID, tier, rank, streak ----
+    pill_y = avatar_box[3] + 26
+    font_pill = _load_font(24, bold=True)
+
+    def draw_pill(x, text, color):
+        bbx = draw.textbbox((0, 0), text, font=font_pill)
+        tw_ = bbx[2] - bbx[0]
+        pad = 22
+        box = [x, pill_y, x + tw_ + pad * 2, pill_y + 46]
+        layer = _rounded_rect_layer((W, H), box, radius=23, fill=(*color, 24), outline=(*color, 200), width=2)
+        return layer, box, text, bbx
+
     vip_label, vip_color = _vip_tier(stats["total_wagered"])
-    level = _player_level(stats["total_wagered"])
-    font_badge = _load_font(24, bold=True)
-    badge_y = name_y + 78
-
-    vip_text = f"★ VIP {vip_label}"
-    lvl_text = f"LVL {level}"
-    vip_bb = draw.textbbox((0, 0), vip_text, font=font_badge)
-    lvl_bb = draw.textbbox((0, 0), lvl_text, font=font_badge)
-    pad_x = 26
-    vip_w = (vip_bb[2] - vip_bb[0]) + pad_x * 2
-    lvl_w = (lvl_bb[2] - lvl_bb[0]) + pad_x * 2
-    gap = 16
-    total_w = vip_w + lvl_w + gap
-    start_x = (W - total_w) / 2
-    badge_h = 46
-
-    vip_box = [start_x, badge_y, start_x + vip_w, badge_y + badge_h]
-    lvl_box = [start_x + vip_w + gap, badge_y, start_x + vip_w + gap + lvl_w, badge_y + badge_h]
-
-    pill = _rounded_rect_layer((W, H), vip_box, radius=badge_h / 2, fill=(*vip_color, 30), outline=(*vip_color, 220), width=2)
-    bg = Image.alpha_composite(bg, pill)
-    pill2 = _rounded_rect_layer((W, H), lvl_box, radius=badge_h / 2, fill=(255, 255, 255, 18), outline=(255, 255, 255, 90), width=2)
-    bg = Image.alpha_composite(bg, pill2)
-    draw = ImageDraw.Draw(bg)
-    draw.text((vip_box[0] + pad_x, vip_box[1] + (badge_h - (vip_bb[3] - vip_bb[1])) / 2 - vip_bb[1]), vip_text, font=font_badge, fill=vip_color)
-    draw.text((lvl_box[0] + pad_x, lvl_box[1] + (badge_h - (lvl_bb[3] - lvl_bb[1])) / 2 - lvl_bb[1]), lvl_text, font=font_badge, fill=WHITE)
-
-    # ---- Glass stat cards ----
-    net_profit = stats["net_profit"]
-    profit_color = GREEN if net_profit >= 0 else RED
-    profit_sign = "+" if net_profit >= 0 else "-"
-    win_rate = (stats["wins_count"] / stats["games_played"] * 100) if stats["games_played"] > 0 else 0.0
-    balance = get_balance(user_id)
-    joined_str = time.strftime("%d %b %Y", time.localtime(stats.get("joined_at", time.time())))
     streak_type = stats.get("streak_type")
     streak_n = stats.get("current_streak", 0)
-    streak_str = f"{streak_n} {'Win' if streak_type == 'win' else 'Loss'}{'es' if streak_n != 1 and streak_type != 'win' else ('s' if streak_n != 1 else '')}" if streak_type else "—"
 
-    cards = [
-        ("balance", "Balance", f"${balance:,.2f}", WHITE),
-        ("target", "Total Wagered", f"${stats['total_wagered']:,.2f}", WHITE),
-        ("arrow_up" if net_profit >= 0 else "arrow_down", "Profit / Loss", f"{profit_sign}${abs(net_profit):,.2f}", profit_color),
-        ("ring_pct", "Win Rate", f"{win_rate:.1f}%", GOLD),
-        ("dice", "Total Bets", f"{stats['games_played']:,}", WHITE),
-        ("diamond", "Biggest Win", f"${stats['biggest_win']:,.2f}", GOLD),
-        ("arrow_down", "Biggest Loss", f"${stats['biggest_loss']:,.2f}", RED),
-        ("deposit", "Deposits", f"${stats['deposits_total']:,.2f}", WHITE),
-        ("withdraw", "Withdrawals", f"${stats['withdrawals_total']:,.2f}", WHITE),
-        ("flame", "Current Streak", streak_str, GOLD if streak_type == "win" else (RED if streak_type == "loss" else MUTED)),
-    ]
+    pills = [draw_pill(margin, str(user_id), MUTED)]
+    pills.append(draw_pill(pills[0][1][2] + 14, f"\u2605 {vip_label.title()}", vip_color))
+    pills.append(draw_pill(pills[1][1][2] + 14, f"Rank #{rank}", GOLD))
+    if streak_type:
+        streak_color = GREEN if streak_type == "win" else RED
+        pills.append(draw_pill(pills[2][1][2] + 14, f"{streak_n}-{streak_type} streak", streak_color))
 
-    margin = 56
-    gap_x = 22
-    col_w = (W - margin * 2 - gap_x) / 2
-    card_h = 168
-    row_gap = 22
-    grid_top = int(badge_y + badge_h + 56)
-
-    font_label = _load_font(25)
-    font_value = _load_font(38, bold=True)
-    icon_r = 30
-
-    for idx, (icon_kind, label, value, color) in enumerate(cards):
-        col = idx % 2
-        row = idx // 2
-        x0 = margin + col * (col_w + gap_x)
-        y0 = grid_top + row * (card_h + row_gap)
-        x1 = x0 + col_w
-        y1 = y0 + card_h
-
-        shadow = _rounded_rect_layer((W, H), [x0, y0 + 10, x1, y1 + 10], radius=28, fill=(0, 0, 0, 120))
-        shadow = shadow.filter(ImageFilter.GaussianBlur(14))
-        bg = Image.alpha_composite(bg, shadow)
-        glass = _rounded_rect_layer((W, H), [x0, y0, x1, y1], radius=28, fill=CARD_FILL, outline=CARD_BORDER, width=2)
-        bg = Image.alpha_composite(bg, glass)
-
+    for layer, box, text, bbx in pills:
+        bg = Image.alpha_composite(bg, layer)
     draw = ImageDraw.Draw(bg)
-    for idx, (icon_kind, label, value, color) in enumerate(cards):
-        col = idx % 2
-        row = idx // 2
-        x0 = margin + col * (col_w + gap_x)
-        y0 = grid_top + row * (card_h + row_gap)
+    colors_seq = [MUTED, vip_color, GOLD] + ([GREEN if streak_type == "win" else RED] if streak_type else [])
+    for (layer, box, text, bbx), col in zip(pills, colors_seq):
+        draw.text((box[0] + 22, box[1] + (46 - (bbx[3] - bbx[1])) / 2 - bbx[1]), text, font=font_pill, fill=col)
 
-        icon_cx = x0 + 54
-        icon_cy = y0 + 54
-        _draw_stat_icon(draw, icon_kind, icon_cx, icon_cy, icon_r, color)
+    section_y = pill_y + 46 + 34
 
-        draw.text((x0 + 28, y0 + 100), label, font=font_label, fill=MUTED)
-        draw.text((x0 + 28, y0 + 128), value, font=font_value, fill=color)
+    # ---- Section title ----
+    font_section = _load_font(34, bold=True)
+    title = f"{brand.split()[0].title()} Stats (30d)"
+    draw.line([(margin, section_y + 20), (margin + 220, section_y + 20)], fill=RED, width=2)
+    tb = draw.textbbox((0, 0), title, font=font_section)
+    draw.text(((W - (tb[2] - tb[0])) / 2, section_y), title, font=font_section, fill=WHITE)
+    draw.line([(W - margin - 220, section_y + 20), (W - margin, section_y + 20)], fill=RED, width=2)
 
-    # ---- Join Date, full-width card ----
-    jd_row = len(cards) // 2 if len(cards) % 2 == 0 else (len(cards) // 2 + 1)
-    jd_y0 = grid_top + jd_row * (card_h + row_gap)
-    jd_y1 = jd_y0 + card_h
-    jd_x0, jd_x1 = margin, W - margin
+    grid_top = section_y + 60
 
-    shadow = _rounded_rect_layer((W, H), [jd_x0, jd_y0 + 10, jd_x1, jd_y1 + 10], radius=28, fill=(0, 0, 0, 120))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(14))
-    bg = Image.alpha_composite(bg, shadow)
-    glass = _rounded_rect_layer((W, H), [jd_x0, jd_y0, jd_x1, jd_y1], radius=28, fill=CARD_FILL, outline=CARD_BORDER, width=2)
+    # ---- 4 KPI boxes ----
+    kpi_h = 190
+    gap_x = 18
+    kpi_w = (W - margin * 2 - gap_x * 3) / 4
+    pnl_30d = d30["pnl_30d"]
+    kpis = [
+        ("controller", f"{d30['games_30d']}", "Total Games", BLUE_NEON),
+        ("target", fmt(d30["wagered_30d"]), "Total Wagered", GOLD),
+        ("ring_pct", f"{d30['win_rate_30d']:.1f}%", "Win Rate", GREEN),
+        ("arrow_down" if pnl_30d < 0 else "arrow_up", fmt(pnl_30d), "Total PnL", RED if pnl_30d < 0 else GREEN),
+    ]
+    for i in range(4):
+        x0 = margin + i * (kpi_w + gap_x)
+        glass = _rounded_rect_layer((W, H), [x0, grid_top, x0 + kpi_w, grid_top + kpi_h], radius=24, fill=CARD_FILL, outline=CARD_BORDER, width=2)
+        bg = Image.alpha_composite(bg, glass)
+    draw = ImageDraw.Draw(bg)
+    font_kpi_val = _load_font(40, bold=True)
+    font_kpi_label = _load_font(22)
+    for i, (icon, val, label, color) in enumerate(kpis):
+        x0 = margin + i * (kpi_w + gap_x)
+        cx = x0 + kpi_w / 2
+        if icon == "ring_pct":
+            r = 26
+            w_ = max(2, int(r * 0.16))
+            draw.arc([cx - r, grid_top + 48 - r, cx + r, grid_top + 48 + r], start=-90, end=270, fill=(255, 255, 255, 40), width=w_)
+            sweep = 360 * max(0.0, min(1.0, d30["win_rate_30d"] / 100))
+            draw.arc([cx - r, grid_top + 48 - r, cx + r, grid_top + 48 + r], start=-90, end=-90 + sweep, fill=color, width=w_)
+        else:
+            _draw_stat_icon(draw, icon, cx, grid_top + 48, 26, color)
+        vb = draw.textbbox((0, 0), val, font=font_kpi_val)
+        draw.text((cx - (vb[2] - vb[0]) / 2, grid_top + 92), val, font=font_kpi_val, fill=color)
+        lb = draw.textbbox((0, 0), label, font=font_kpi_label)
+        draw.text((cx - (lb[2] - lb[0]) / 2, grid_top + 140), label, font=font_kpi_label, fill=MUTED)
+
+    # ---- Profit trend chart + Win/Loss panel ----
+    panel_y0 = grid_top + kpi_h + 22
+    panel_h = 300
+    chart_w = (W - margin * 2 - gap_x) * 0.56
+    chart_x0, chart_x1 = margin, margin + chart_w
+    wl_x0, wl_x1 = chart_x1 + gap_x, W - margin
+
+    glass = _rounded_rect_layer((W, H), [chart_x0, panel_y0, chart_x1, panel_y0 + panel_h], radius=24, fill=CARD_FILL, outline=CARD_BORDER, width=2)
+    bg = Image.alpha_composite(bg, glass)
+    glass2 = _rounded_rect_layer((W, H), [wl_x0, panel_y0, wl_x1, panel_y0 + panel_h], radius=24, fill=CARD_FILL, outline=CARD_BORDER, width=2)
+    bg = Image.alpha_composite(bg, glass2)
+    draw = ImageDraw.Draw(bg)
+
+    font_panel_title = _load_font(24, bold=True)
+    draw.text((chart_x0 + 24, panel_y0 + 18), "Profit Trend (30d)", font=font_panel_title, fill=WHITE)
+    draw.text((wl_x0 + 24, panel_y0 + 18), "Win / Loss (30d)", font=font_panel_title, fill=WHITE)
+
+    pad_l, pad_r, pad_t, pad_b = 68, 24, 60, 46
+    plot_x0 = chart_x0 + pad_l
+    plot_x1 = chart_x1 - pad_r
+    plot_y0 = panel_y0 + pad_t
+    plot_y1 = panel_y0 + panel_h - pad_b
+
+    series = d30["cumulative_pnl_series"]
+    mn, mx = min(series), max(series)
+    if mx == mn:
+        mx = mn + 1
+    rng = mx - mn
+    pad_rng = rng * 0.15
+    mn -= pad_rng
+    mx += pad_rng
+    rng = mx - mn
+
+    def sx(i):
+        return plot_x0 + (plot_x1 - plot_x0) * i / (len(series) - 1)
+
+    def sy(v):
+        return plot_y1 - (plot_y1 - plot_y0) * (v - mn) / rng
+
+    if mn < 0 < mx:
+        zy = sy(0)
+        draw.line([(plot_x0, zy), (plot_x1, zy)], fill=(255, 255, 255, 40), width=1)
+
+    line_color = GREEN if series[-1] >= series[0] else RED
+    pts = [(sx(i), sy(v)) for i, v in enumerate(series)]
+    draw.line(pts, fill=line_color, width=4, joint="curve")
+    draw.ellipse([pts[-1][0] - 7, pts[-1][1] - 7, pts[-1][0] + 7, pts[-1][1] + 7], fill=line_color)
+
+    font_yaxis = _load_font(15)
+    for gi in range(5):
+        gv = mn + rng * gi / 4
+        gy = sy(gv)
+        draw.line([(plot_x0, gy), (plot_x1, gy)], fill=(255, 255, 255, 14), width=1)
+        lbl = fmt(gv).split(".")[0]
+        draw.text((chart_x0 + 8, gy - 8), lbl, font=font_yaxis, fill=MUTED)
+
+    font_axis = _load_font(18)
+    for lbl, frac in (("30d ago", 0.0), ("15d ago", 0.5), ("Today", 1.0)):
+        x = plot_x0 + (plot_x1 - plot_x0) * frac
+        lb = draw.textbbox((0, 0), lbl, font=font_axis)
+        tx = x - (lb[2] - lb[0]) / 2
+        if frac == 0.0:
+            tx = plot_x0
+        if frac == 1.0:
+            tx = plot_x1 - (lb[2] - lb[0])
+        draw.text((tx, plot_y1 + 10), lbl, font=font_axis, fill=MUTED)
+
+    wins_30d, losses_30d = d30["wins_30d"], d30["losses_30d"]
+    total = wins_30d + losses_30d
+    wl_cx = (wl_x0 + wl_x1) / 2
+    font_wl_big = _load_font(40, bold=True)
+    wt, lt = f"{wins_30d} W", f"{losses_30d} L"
+    ltb = draw.textbbox((0, 0), lt, font=font_wl_big)
+    draw.text((wl_x0 + 24, panel_y0 + 90), wt, font=font_wl_big, fill=GREEN)
+    draw.text((wl_x1 - 24 - (ltb[2] - ltb[0]), panel_y0 + 90), lt, font=font_wl_big, fill=RED)
+
+    bar_y0, bar_y1 = panel_y0 + 160, panel_y0 + 186
+    bar_x0, bar_x1 = wl_x0 + 24, wl_x1 - 24
+    win_frac = (wins_30d / total) if total else 0
+    split_x = bar_x0 + (bar_x1 - bar_x0) * win_frac
+    draw.rounded_rectangle([bar_x0, bar_y0, bar_x1, bar_y1], radius=13, fill=(255, 255, 255, 20))
+    if win_frac > 0:
+        draw.rounded_rectangle([bar_x0, bar_y0, max(bar_x0 + 26, split_x), bar_y1], radius=13, fill=GREEN)
+    if win_frac < 1:
+        draw.rounded_rectangle([min(split_x, bar_x1 - 26), bar_y0, bar_x1, bar_y1], radius=13, fill=RED)
+
+    font_wl_small = _load_font(22)
+    sub = f"{d30['win_rate_30d']:.0f}% win rate  \u00b7  {total} games"
+    sb = draw.textbbox((0, 0), sub, font=font_wl_small)
+    draw.text((wl_cx - (sb[2] - sb[0]) / 2, bar_y1 + 18), sub, font=font_wl_small, fill=MUTED)
+
+    # ---- 4 highlight boxes ----
+    small_y0 = panel_y0 + panel_h + 22
+    small_h = 150
+    small_w = (W - margin * 2 - gap_x * 3) / 4
+    biggest_win_game = d30["biggest_win_game"] or "—"
+    most_profitable_game = d30["most_profitable_game"] or "—"
+    most_profitable_pnl = d30["most_profitable_pnl"]
+    favourite_game = d30["favourite_game"] or "—"
+    smalls = [
+        ("trophy", "Biggest Win", fmt(d30["biggest_win_amt"]), f"in {biggest_win_game}", GOLD),
+        ("dice", "Most Profitable", (f"+{fmt(most_profitable_pnl)}" if most_profitable_pnl >= 0 else fmt(most_profitable_pnl)), most_profitable_game, GREEN if most_profitable_pnl >= 0 else RED),
+        ("cards", "Favourite Game", favourite_game, "most played", GOLD),
+        ("coins", "Avg Bet", fmt(d30["avg_bet"]), "per game", BLUE_NEON),
+    ]
+    for i in range(4):
+        x0 = margin + i * (small_w + gap_x)
+        glass = _rounded_rect_layer((W, H), [x0, small_y0, x0 + small_w, small_y0 + small_h], radius=22, fill=CARD_FILL, outline=CARD_BORDER, width=2)
+        bg = Image.alpha_composite(bg, glass)
+    draw = ImageDraw.Draw(bg)
+    font_small_label = _load_font(18)
+    font_small_val = _load_font(28, bold=True)
+    font_small_sub = _load_font(17)
+    for i, (icon, label, val, sub, color) in enumerate(smalls):
+        x0 = margin + i * (small_w + gap_x)
+        _draw_stat_icon(draw, icon, x0 + 34, small_y0 + 34, 18, color)
+        draw.text((x0 + 18, small_y0 + 62), label, font=font_small_label, fill=MUTED)
+        draw.text((x0 + 18, small_y0 + 84), val, font=font_small_val, fill=color)
+        draw.text((x0 + 18, small_y0 + 120), sub, font=font_small_sub, fill=MUTED)
+
+    # ---- Game breakdown table ----
+    table_y0 = small_y0 + small_h + 22
+    table_x0, table_x1 = margin, W - margin
+    rows = sorted(d30["per_game"].items(), key=lambda kv: kv[1]["count"], reverse=True)
+    row_h = 78
+    header_h = 96
+    if rows:
+        table_h = header_h + row_h * len(rows) + 20
+    else:
+        table_h = 150
+    glass = _rounded_rect_layer((W, H), [table_x0, table_y0, table_x1, table_y0 + table_h], radius=24, fill=CARD_FILL, outline=CARD_BORDER, width=2)
     bg = Image.alpha_composite(bg, glass)
     draw = ImageDraw.Draw(bg)
-    _draw_stat_icon(draw, "calendar", jd_x0 + 54, jd_y0 + 54, icon_r, GOLD)
-    draw.text((jd_x0 + 28, jd_y0 + 100), "Member Since", font=font_label, fill=MUTED)
-    draw.text((jd_x0 + 28, jd_y0 + 128), joined_str, font=font_value, fill=WHITE)
 
-    # ---- Footer brand mark ----
-    footer_y = jd_y1 + 46
-    font_footer = _load_font(22, bold=True)
-    footer_text = "T R A Q D   C A S I N O"
+    font_table_title = _load_font(24, bold=True)
+    draw.text((table_x0 + 24, table_y0 + 18), "Game Breakdown (Last 30 Days)", font=font_table_title, fill=WHITE)
+
+    if not rows:
+        font_empty = _load_font(22)
+        draw.text((table_x0 + 24, table_y0 + 70), "No games played in the last 30 days yet.", font=font_empty, fill=MUTED)
+    else:
+        font_th = _load_font(18)
+        header_y = table_y0 + header_h
+        draw.text((table_x0 + 24, header_y - 32), "GAME", font=font_th, fill=MUTED)
+        mid_label = "GAMES / WIN RATE"
+        mb = draw.textbbox((0, 0), mid_label, font=font_th)
+        draw.text((table_x0 + (table_x1 - table_x0) * 0.55 - (mb[2] - mb[0]) / 2, header_y - 32), mid_label, font=font_th, fill=MUTED)
+        net_label = "NET PNL"
+        nb = draw.textbbox((0, 0), net_label, font=font_th)
+        draw.text((table_x1 - 24 - (nb[2] - nb[0]), header_y - 32), net_label, font=font_th, fill=MUTED)
+        draw.line([(table_x0 + 24, header_y), (table_x1 - 24, header_y)], fill=(255, 255, 255, 30), width=1)
+
+        game_colors = [GOLD, (200, 120, 255), BLUE_NEON, GREEN, RED, (255, 150, 90)]
+        for i, (game, gs) in enumerate(rows):
+            ry0 = header_y + i * row_h
+            color = game_colors[i % len(game_colors)]
+            icon_box = [table_x0 + 24, ry0 + 16, table_x0 + 24 + 44, ry0 + 16 + 44]
+            layer = _rounded_rect_layer((W, H), icon_box, radius=12, fill=(*color, 40), outline=(*color, 200), width=2)
+            bg = Image.alpha_composite(bg, layer)
+        draw = ImageDraw.Draw(bg)
+        font_row_name = _load_font(26, bold=True)
+        font_row_sub = _load_font(20)
+        font_row_pnl = _load_font(26, bold=True)
+        for i, (game, gs) in enumerate(rows):
+            ry0 = header_y + i * row_h
+            color = game_colors[i % len(game_colors)]
+            init = game.strip()[0].upper()
+            ib = draw.textbbox((0, 0), init, font=font_row_name)
+            draw.text((table_x0 + 24 + 22 - (ib[2] - ib[0]) / 2, ry0 + 16 + 22 - (ib[3] - ib[1]) / 2 - ib[1]), init, font=font_row_name, fill=color)
+
+            draw.text((table_x0 + 24 + 56, ry0 + 16 + 8), game, font=font_row_name, fill=color)
+            win_rate_g = (gs["wins"] / gs["count"] * 100) if gs["count"] else 0
+            mid_text = f"{gs['count']} games | {win_rate_g:.0f}% WR"
+            mtb = draw.textbbox((0, 0), mid_text, font=font_row_sub)
+            draw.text((table_x0 + (table_x1 - table_x0) * 0.55 - (mtb[2] - mtb[0]) / 2, ry0 + 16 + 24), mid_text, font=font_row_sub, fill=MUTED)
+
+            pnl_color = GREEN if gs["net_pnl"] >= 0 else RED
+            pnl_text = f"+{fmt(gs['net_pnl'])}" if gs["net_pnl"] >= 0 else fmt(gs["net_pnl"])
+            ptb = draw.textbbox((0, 0), pnl_text, font=font_row_pnl)
+            draw.text((table_x1 - 24 - (ptb[2] - ptb[0]), ry0 + 16 + 8), pnl_text, font=font_row_pnl, fill=pnl_color)
+
+    # ---- Footer ----
+    footer_y = table_y0 + table_h + 30
+    font_footer = _load_font(20, bold=True)
+    footer_text = f"Play Responsibly  |  @{handle}" if handle else "Play Responsibly"
     fb = draw.textbbox((0, 0), footer_text, font=font_footer)
-    draw.text(((W - (fb[2] - fb[0])) / 2 - fb[0], footer_y), footer_text, font=font_footer, fill=(*GOLD, 200) if False else GOLD_SOFT)
+    draw.text(((W - (fb[2] - fb[0])) / 2, footer_y), footer_text, font=font_footer, fill=GOLD_SOFT)
+
+    final_h = int(footer_y + 50)
+    bg = bg.crop((0, 0, W, final_h))
 
     out_path = f"/tmp/stats_{user_id}_{int(time.time() * 1000)}.png"
     bg.convert("RGB").save(out_path, format="PNG")
     return out_path
 
 
-def handle_stats_command(chat_id, user_id, username):
+def handle_stats_command(chat_id, user_id, username, handle=None):
     if not _PIL_AVAILABLE:
         send_message(
             chat_id,
@@ -1509,7 +1793,7 @@ def handle_stats_command(chat_id, user_id, username):
         return
     card_path = None
     try:
-        card_path = build_stats_card(user_id, username)
+        card_path = build_stats_card(user_id, username, handle)
         send_photo(chat_id, card_path, caption=f"{cemoji('trophy')} <b>{mention(user_id, username)}'s stats</b>")
     except Exception as e:
         print(f"⚠️ /stats failed for user {user_id}: {e}")
@@ -1574,13 +1858,7 @@ def send_photo(chat_id, photo_path_or_file_id, caption=None, reply_markup=None, 
             files = {"photo": f}
             resp = SESSION.post(f"{API}/sendPhoto", data=params, files=files, timeout=30)
             result = resp.json()
-            # Only cache this upload's file_id as the reusable roulette-table
-            # file_id if it actually WAS the roulette table image - any other
-            # locally-generated photo (e.g. a /stats card) sent through this
-            # same code path must never overwrite that cache, or the next
-            # /roulette spin ends up showing a random user's stats card
-            # instead of the table.
-            if result.get("ok") and os.path.abspath(photo_path_or_file_id) == os.path.abspath(ROULETTE_TABLE_PATH):
+            if result.get("ok"):
                 global ROULETTE_TABLE_FILE_ID
                 ROULETTE_TABLE_FILE_ID = result["result"]["photo"][-1]["file_id"]
             return result
@@ -2841,11 +3119,6 @@ def handle_callback(callback_query):
             f"Type: <code>/diceroll {cmd} &lt;amount&gt;</code>\n"
             f"Example: <code>/diceroll {cmd} 10</code>"
         )
-        return
-
-    if action == "db_rounds":
-        rounds, amount_s, owner_id_s = int(parts[1]), parts[2], parts[3]
-        dicebattle_confirm_rounds(chat_id, message_id, clicking_user_id, callback_id, rounds, float(amount_s), int(owner_id_s), username)
         return
 
     if action == "dr_ou":
@@ -5230,8 +5503,7 @@ def handle_message(message):
     # "text" at all, so this has to be checked before anything below that
     # assumes a text command.
     if message.get("dice"):
-        if not try_handle_diceroll_message(chat_id, user_id, message):
-            try_handle_dicebattle_message(chat_id, user_id, message)
+        try_handle_diceroll_message(chat_id, user_id, message)
         return
 
     uname = message["from"].get("username")
@@ -5575,7 +5847,8 @@ def handle_message(message):
 
     if command == "/stats":
         name = message["from"].get("first_name", "Player")
-        handle_stats_command(chat_id, user_id, name)
+        handle = message["from"].get("username")
+        handle_stats_command(chat_id, user_id, name, handle)
         return
 
     if command == "/currency":
@@ -5675,44 +5948,6 @@ def handle_message(message):
             send_message(chat_id, f"✅ Broadcast complete. Sent: {sent}, Failed: {failed}.")
 
         threading.Thread(target=_run_broadcast, daemon=True).start()
-        return
-
-    if command == "/dice":
-        username = message["from"].get("first_name", "Player")
-        chat_type = message["chat"].get("type", "private")
-        handle_dicebattle_command(chat_id, user_id, username, args, chat_type)
-        return
-
-    if command == "/clearmines":
-        # Admin-only, deliberately NOT listed in /help or the command menu.
-        # Force-clears a stuck Mines round (e.g. the Mini App/message got
-        # lost and the player can't start a new one) and refunds the bet
-        # back to whichever pool(s) it came from - without counting as a
-        # stats win or affecting wagering progress.
-        if not is_admin(user_id):
-            return
-        target_id = user_id
-        if args:
-            try:
-                target_id = int(args[0])
-            except ValueError:
-                send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/clearmines</code> (yourself) or <code>/clearmines 123456789</code>")
-                return
-
-        with MINES_LOCK:
-            game = active_mines_games.pop(target_id, None)
-
-        if not game:
-            send_message(chat_id, f"{WARN_EMOJI} No active Mines round found for {target_id}.")
-            return
-
-        new_balance = refund_balance(target_id, game["amount"])
-        send_message(
-            chat_id,
-            f"🧹 Cleared stuck Mines round for <code>{target_id}</code>.\n"
-            f"Refunded: <b>${game['amount']:.2f}</b>\n"
-            f"New balance: <b>${new_balance:.2f}</b>"
-        )
         return
 
     if command == "/testfund":
@@ -6351,15 +6586,6 @@ active_dice_games = {}   # token -> game dict
 user_active_dice = {}    # user_id -> token (one live Dice round per user)
 DICE_LOCK = threading.Lock()
 
-# /dice - "First to N" batch dice battle vs a helper bot. Distinct from
-# Lucky Roll (now /luckyroll, above) and from /diceroll's round-alternating
-# duels. Here the bot throws ALL of its N dice back-to-back up front, then
-# the player throws all N of theirs, and the higher total wins.
-active_dicebattle_games = {}  # user_id -> game dict
-DICEBATTLE_LOCK = threading.Lock()
-DICEBATTLE_HOUSE_EDGE = 0.01
-DICEBATTLE_PAYOUT = round((1 - DICEBATTLE_HOUSE_EDGE) / 0.5, 2)  # 1.98x, same 50/50 convention as the rest
-
 
 def dice_multiplier(win_chance_pct, house_edge=DICE_HOUSE_EDGE):
     """Fair multiplier for a win chance given as a percentage (0-100) - same
@@ -6706,21 +6932,10 @@ diceroll_open_challenges = {}    # chat_id -> game_id (one open 1v1/Crazy challe
 
 
 def send_helper_dice(chat_id):
-    """Throws a real animated Telegram dice and returns the value Telegram
-    rolled (1-6) - this is the bot's "throw" in vs-Bot matches.
-
-    A helper bot is a *separate* Telegram bot account, and its messages
-    can only ever land in a chat it's actually a member of - i.e. a group.
-    A private chat is strictly a 1-on-1 thread between the player and
-    whichever bot they're talking to; a helper bot was never added to it
-    (Telegram won't even let a bot message a user who hasn't /start'ed
-    that specific bot), so picking a helper token for a DM used to fail
-    silently and fall back to an invisible server-rolled number - no dice
-    animation at all. Group chat_ids are always negative in Telegram's
-    API, private chat_ids are always positive, so that's enough to tell
-    them apart without threading chat_type through every call site."""
-    use_helper = bool(HELPER_BOT_TOKENS) and chat_id < 0
-    token = random.choice(HELPER_BOT_TOKENS) if use_helper else BOT_TOKEN
+    """Throws a real animated Telegram dice from a helper bot account (or the
+    main bot if no helpers are configured yet) and returns the value Telegram
+    rolled (1-6). This is the bot's "throw" in vs-Bot matches."""
+    token = random.choice(HELPER_BOT_TOKENS) if HELPER_BOT_TOKENS else BOT_TOKEN
     try:
         resp = SESSION.post(f"https://api.telegram.org/bot{token}/sendDice",
                              json={"chat_id": chat_id, "emoji": "🎲"}, timeout=15)
@@ -7466,189 +7681,6 @@ def try_handle_diceroll_message(chat_id, user_id, message):
     return True
 
 
-# =============================================================================
-# DICE BATTLE — /dice <amount>. "First to N" is really "N dice each,
-# highest total wins": pick 1, 2, or 3. The helper bot throws all N of its
-# dice back-to-back immediately, then the player throws all N of theirs
-# (one at a time, tracked). Whoever's total is higher wins DICEBATTLE_PAYOUT
-# (1.98x); an equal total is a push (bet returned, no stats win recorded).
-# =============================================================================
-
-DICEBATTLE_ROUND_EMOJI = {"vs_bot_icon": "5971808079811972376"}
-
-
-def dicebattle_rounds_keyboard(amount, user_id):
-    return {"inline_keyboard": [[
-        {"text": f"First to {n}", "callback_data": f"db_rounds:{n}:{amount}:{user_id}"}
-        for n in (1, 2, 3)
-    ]]}
-
-
-def handle_dicebattle_command(chat_id, user_id, username, args, chat_type="private"):
-    if not args:
-        send_message(
-            chat_id,
-            f"🎲 <b>Dice Battle</b> — you vs a helper bot, real Telegram dice.\n\n"
-            f"Usage: <code>/dice &lt;amount&gt;</code>\n"
-            f"Pick how many dice each side throws (1-3). The bot throws all "
-            f"its dice first, then you throw yours - highest total wins."
-        )
-        return
-
-    amount, _amt_err = resolve_bet_amount(user_id, args[0])
-    if _amt_err == "invalid_number":
-        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/dice 10</code>")
-        return
-    if _amt_err == "rate_unavailable":
-        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
-        return
-    if amount < MIN_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
-        return
-    if amount > MAX_BET:
-        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is ${MAX_BET:.2f}")
-        return
-    if user_id in active_dicebattle_games:
-        send_message(chat_id, f"{WARN_EMOJI} You already have an active Dice Battle! Finish it first.")
-        return
-    balance = get_balance(user_id)
-    if amount > balance:
-        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
-        return
-
-    send_message(
-        chat_id,
-        f"🎲 <b>Dice Battle</b> — {mention(user_id, username)}\n\n"
-        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
-        f"Pick how many dice each side throws:",
-        reply_markup=dicebattle_rounds_keyboard(amount, user_id)
-    )
-
-
-def dicebattle_confirm_rounds(chat_id, message_id, clicking_user_id, callback_id, rounds, amount, owner_id, username):
-    if clicking_user_id != owner_id:
-        answer_callback(callback_id, "This isn't your bet.", show_alert=True)
-        return
-    with DICEBATTLE_LOCK:
-        if owner_id in active_dicebattle_games:
-            answer_callback(callback_id, "You already have an active Dice Battle!", show_alert=True)
-            return
-        balance = get_balance(owner_id)
-        if amount > balance:
-            answer_callback(callback_id, "Insufficient balance.", show_alert=True)
-            return
-        adjust_balance(owner_id, -amount)
-        active_dicebattle_games[owner_id] = {
-            "chat_id": chat_id, "user_id": owner_id, "username": username,
-            "amount": amount, "rounds": rounds,
-            "bot_rolls": [], "player_rolls": [], "status": "bot_throwing",
-        }
-    answer_callback(callback_id, "Locked in!")
-    edit_message(
-        chat_id, message_id,
-        f"🎲 <b>Dice Battle</b> — {mention(owner_id, username)}\n\n"
-        f"Bet: <b>{fmt_money(owner_id, amount)}</b> · First to <b>{rounds}</b>\n\n"
-        f"🤖 Helper bot is throwing..."
-    )
-
-    def _run_bot_throws():
-        rolls = []
-        for _ in range(rounds):
-            rolls.append(send_helper_dice(chat_id))
-            time.sleep(1.2)  # let each animation land before the next throw
-        with DICEBATTLE_LOCK:
-            game = active_dicebattle_games.get(owner_id)
-            if not game or game["status"] != "bot_throwing":
-                return  # cleared/cancelled while throws were in flight
-            game["bot_rolls"] = rolls
-            game["status"] = "awaiting_player"
-        faces = " ".join(DICEROLL_FACES[r] for r in rolls)
-        send_message(
-            chat_id,
-            f"🤖 Bot rolled: {faces}  (total <b>{sum(rolls)}</b>)\n\n"
-            f"{mention(owner_id, username)}, send your 🎲 dice emoji now - "
-            f"you need <b>{rounds}</b> throw{'s' if rounds > 1 else ''}."
-        )
-
-    threading.Thread(target=_run_bot_throws, daemon=True).start()
-
-
-def try_handle_dicebattle_message(chat_id, user_id, message):
-    """Same anti-cheat check as Diceroll: reject forwarded dice, only ever
-    accept a live throw. Returns True if this dice was consumed by an
-    active Dice Battle round, False otherwise (so other handlers can try)."""
-    dice = message.get("dice")
-    if not dice or dice.get("emoji") != "🎲":
-        return False
-
-    if any(k in message for k in (
-        "forward_origin", "forward_date", "forward_from",
-        "forward_from_chat", "forward_sender_name",
-    )):
-        with DICEBATTLE_LOCK:
-            has_active = user_id in active_dicebattle_games and active_dicebattle_games[user_id]["status"] == "awaiting_player"
-        if has_active:
-            send_message(chat_id, f"{WARN_EMOJI} That's a forwarded dice, not a live throw. Send a fresh 🎲 to roll for real.")
-        return False
-
-    with DICEBATTLE_LOCK:
-        game = active_dicebattle_games.get(user_id)
-        if not game or game["chat_id"] != chat_id or game["status"] != "awaiting_player":
-            return False
-        game["player_rolls"].append(dice["value"])
-        done = len(game["player_rolls"]) >= game["rounds"]
-        if done:
-            game["status"] = "settling"
-
-    if not done:
-        remaining = game["rounds"] - len(game["player_rolls"])
-        send_message(chat_id, f"🎲 Got it! {remaining} more throw{'s' if remaining > 1 else ''} to go.")
-        return True
-
-    _dicebattle_settle(game)
-    return True
-
-
-def _dicebattle_settle(game):
-    chat_id, owner_id, username, amount = game["chat_id"], game["user_id"], game["username"], game["amount"]
-    bot_total = sum(game["bot_rolls"])
-    player_total = sum(game["player_rolls"])
-
-    with DICEBATTLE_LOCK:
-        active_dicebattle_games.pop(owner_id, None)
-
-    bot_faces = " ".join(DICEROLL_FACES[r] for r in game["bot_rolls"])
-    player_faces = " ".join(DICEROLL_FACES[r] for r in game["player_rolls"])
-    lines = (
-        f"🎲 <b>Dice Battle Result</b> — {mention(owner_id, username)}\n\n"
-        f"🤖 Bot: {bot_faces}  (total <b>{bot_total}</b>)\n"
-        f"{mention(owner_id, username)}: {player_faces}  (total <b>{player_total}</b>)\n\n"
-    )
-
-    if player_total == bot_total:
-        adjust_balance(owner_id, amount)  # push - full refund, not a stats win
-        new_balance = get_balance(owner_id)
-        send_message(chat_id, lines + f"🤝 Tie! Bet refunded.\nBalance: <b>{fmt_money(owner_id, new_balance)}</b>")
-        return
-
-    if player_total > bot_total:
-        payout = round(amount * DICEBATTLE_PAYOUT, 2)
-        adjust_balance(owner_id, payout)
-        new_balance = get_balance(owner_id)
-        send_message(
-            chat_id,
-            lines + f"🏆 You win! Payout: <b>{fmt_money(owner_id, payout)}</b>\n"
-            f"Balance: <b>{fmt_money(owner_id, new_balance)}</b>"
-        )
-    else:
-        new_balance = get_balance(owner_id)
-        send_message(
-            chat_id,
-            lines + f"❌ Bot wins. Lost: <b>{fmt_money(owner_id, amount)}</b>\n"
-            f"Balance: <b>{fmt_money(owner_id, new_balance)}</b>"
-        )
-
-
 # ---------------------------------------------------------------------------
 # DB SYNC — every active-game dict in this file (Mines/Towers/Keno are
 # keyed by user_id; Crash/Blackjack/Dice/ChickenRoad are keyed by a token,
@@ -7855,7 +7887,6 @@ def main():
             {"command": "blackjack", "description": "Play Blackjack"},
             {"command": "luckyroll", "description": "Play Lucky Roll (dice)"},
             {"command": "diceroll", "description": "Real 🎲 dice games: OE/HL/1v1/Crazy/Predict"},
-            {"command": "dice", "description": "Dice Battle: N dice each vs a helper bot, highest total wins"},
             {"command": "crash", "description": "Play Crash"},
             {"command": "chickenroad", "description": "Play Chicken Road"},
             {"command": "roulette", "description": "Play Roulette"},
