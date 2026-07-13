@@ -658,6 +658,28 @@ _last_bet_split = {}  # user_id -> (bonus_used, real_used, bet_amount) from thei
                        # bonus/test money to actually stay non-withdrawable (see below).
 
 
+def refund_balance(user_id, amount):
+    """Refunds a bet amount back to whichever pool(s) it was deducted from
+    (via the matching _last_bet_split, same proportional logic adjust_balance
+    uses for real wins) WITHOUT counting toward /stats or wagering progress -
+    for admin utilities (like /clearmines) that force-clear a stuck round.
+    If no matching split is found (e.g. a later bet already overwrote it),
+    falls back to refunding straight into real."""
+    with WALLET_LOCK:
+        w = _ensure_wallet(user_id)
+        split = _last_bet_split.pop(user_id, None)
+        if split and abs(split[2] - amount) < 0.01:
+            bonus_used, real_used, bet_amount = split
+            bonus_share = bonus_used / bet_amount
+            real_share = real_used / bet_amount
+            w["bonus"] = round(w["bonus"] + amount * bonus_share, 2)
+            w["real"] = round(w["real"] + amount * real_share, 2)
+        else:
+            w["real"] = round(w["real"] + amount, 2)
+        _persist_wallet(user_id)
+        return round(w["real"] + w["bonus"], 2)
+
+
 def adjust_balance(user_id, delta):
     """Legacy-compatible helper: every existing game calls adjust_balance()
     directly for both the bet deduction (-amount) and the payout (+payout)
@@ -5640,6 +5662,38 @@ def handle_message(message):
             send_message(chat_id, f"✅ Broadcast complete. Sent: {sent}, Failed: {failed}.")
 
         threading.Thread(target=_run_broadcast, daemon=True).start()
+        return
+
+    if command == "/clearmines":
+        # Admin-only, deliberately NOT listed in /help or the command menu.
+        # Force-clears a stuck Mines round (e.g. the Mini App/message got
+        # lost and the player can't start a new one) and refunds the bet
+        # back to whichever pool(s) it came from - without counting as a
+        # stats win or affecting wagering progress.
+        if not is_admin(user_id):
+            return
+        target_id = user_id
+        if args:
+            try:
+                target_id = int(args[0])
+            except ValueError:
+                send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/clearmines</code> (yourself) or <code>/clearmines 123456789</code>")
+                return
+
+        with MINES_LOCK:
+            game = active_mines_games.pop(target_id, None)
+
+        if not game:
+            send_message(chat_id, f"{WARN_EMOJI} No active Mines round found for {target_id}.")
+            return
+
+        new_balance = refund_balance(target_id, game["amount"])
+        send_message(
+            chat_id,
+            f"🧹 Cleared stuck Mines round for <code>{target_id}</code>.\n"
+            f"Refunded: <b>${game['amount']:.2f}</b>\n"
+            f"New balance: <b>${new_balance:.2f}</b>"
+        )
         return
 
     if command == "/testfund":
