@@ -838,8 +838,15 @@ if not APP_URL:
 _last_edit_ts = {}          # (chat_id, message_id) -> next allowed time
 _last_chat_agg_ts = {}      # chat_id -> next allowed time (aggregate)
 _chat_edit_throttle_lock = threading.Lock()
-MIN_EDIT_INTERVAL = 1.05        # ~1 edit/sec per message
-CHAT_AGG_MIN_INTERVAL = 3.3     # ~18 edits/min per chat (safely under Telegram's ~20/min group guideline)
+# Kept deliberately light - close to Telegram's real per-message/per-chat
+# ceiling rather than a big safety margin. Solo/light play now feels close
+# to instant again. The tradeoff: during a genuine heavy burst (many people
+# tapping in the same chat at the same moment), a specific edit call can
+# still get a 429 - but that only delays THAT one call/user (see the
+# reactive retry below, which sleeps in the calling thread only, not under
+# any shared lock), it no longer freezes the rest of the group.
+MIN_EDIT_INTERVAL = 0.35        # per-message pacing
+CHAT_AGG_MIN_INTERVAL = 1.05    # per-chat aggregate pacing
 
 
 def api_call(method, **params):
