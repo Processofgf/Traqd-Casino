@@ -816,12 +816,32 @@ if not APP_URL:
         APP_URL = f"https://{railway_domain}"
 
 
+# Proactively throttle edits per chat so we never trigger Telegram's flood
+# limit in the first place. Reactive retry_after waits (see api_call below)
+# can be 10-15s once flood control actually kicks in - which is what makes
+# the whole chat look frozen when someone taps Mines tiles rapidly, since
+# every tap fires an editMessageText at the same message/chat.
+_last_chat_edit_ts = {}
+_chat_edit_throttle_lock = threading.Lock()
+MIN_EDIT_INTERVAL = 1.05  # seconds; Telegram allows ~1 edit/sec per chat
+
+
 def api_call(method, **params):
     # Telegram rate-limits per chat; a burst of replies landing at the same
     # instant (e.g. several delayed Coinflip results resolving together)
     # can get a 429 back. Previously that response was just returned as-is
     # and every caller ignored it, so the message silently never sent.
     # Retry a few times, honoring Telegram's own requested wait time.
+    if method in ("editMessageText", "editMessageCaption") and "chat_id" in params:
+        chat_id = params["chat_id"]
+        with _chat_edit_throttle_lock:
+            now = time.time()
+            last = _last_chat_edit_ts.get(chat_id, 0)
+            wait = MIN_EDIT_INTERVAL - (now - last)
+            if wait > 0:
+                time.sleep(wait)
+            _last_chat_edit_ts[chat_id] = time.time()
+
     for attempt in range(4):
         resp = SESSION.post(f"{API}/{method}", data=params, timeout=15)
         data = resp.json()
