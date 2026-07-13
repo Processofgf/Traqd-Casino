@@ -834,13 +834,20 @@ def api_call(method, **params):
     # Retry a few times, honoring Telegram's own requested wait time.
     if method in ("editMessageText", "editMessageCaption") and "chat_id" in params:
         chat_id = params["chat_id"]
+        # Only hold the lock long enough to reserve this chat's next allowed
+        # slot (a dict read+write, microseconds). The actual sleep happens
+        # AFTER releasing the lock, so a chat that's waiting never blocks
+        # edits for any other chat - that was the bug before: sleeping
+        # while holding a single global lock serialized the WHOLE bot to
+        # ~1 edit/sec instead of just throttling per chat.
         with _chat_edit_throttle_lock:
             now = time.time()
             last = _last_chat_edit_ts.get(chat_id, 0)
-            wait = MIN_EDIT_INTERVAL - (now - last)
-            if wait > 0:
-                time.sleep(wait)
-            _last_chat_edit_ts[chat_id] = time.time()
+            next_allowed = max(now, last + MIN_EDIT_INTERVAL)
+            _last_chat_edit_ts[chat_id] = next_allowed
+        wait = next_allowed - now
+        if wait > 0:
+            time.sleep(wait)
 
     for attempt in range(4):
         resp = SESSION.post(f"{API}/{method}", data=params, timeout=15)
