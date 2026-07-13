@@ -1574,7 +1574,13 @@ def send_photo(chat_id, photo_path_or_file_id, caption=None, reply_markup=None, 
             files = {"photo": f}
             resp = SESSION.post(f"{API}/sendPhoto", data=params, files=files, timeout=30)
             result = resp.json()
-            if result.get("ok"):
+            # Only cache this upload's file_id as the reusable roulette-table
+            # file_id if it actually WAS the roulette table image - any other
+            # locally-generated photo (e.g. a /stats card) sent through this
+            # same code path must never overwrite that cache, or the next
+            # /roulette spin ends up showing a random user's stats card
+            # instead of the table.
+            if result.get("ok") and os.path.abspath(photo_path_or_file_id) == os.path.abspath(ROULETTE_TABLE_PATH):
                 global ROULETTE_TABLE_FILE_ID
                 ROULETTE_TABLE_FILE_ID = result["result"]["photo"][-1]["file_id"]
             return result
@@ -6700,10 +6706,21 @@ diceroll_open_challenges = {}    # chat_id -> game_id (one open 1v1/Crazy challe
 
 
 def send_helper_dice(chat_id):
-    """Throws a real animated Telegram dice from a helper bot account (or the
-    main bot if no helpers are configured yet) and returns the value Telegram
-    rolled (1-6). This is the bot's "throw" in vs-Bot matches."""
-    token = random.choice(HELPER_BOT_TOKENS) if HELPER_BOT_TOKENS else BOT_TOKEN
+    """Throws a real animated Telegram dice and returns the value Telegram
+    rolled (1-6) - this is the bot's "throw" in vs-Bot matches.
+
+    A helper bot is a *separate* Telegram bot account, and its messages
+    can only ever land in a chat it's actually a member of - i.e. a group.
+    A private chat is strictly a 1-on-1 thread between the player and
+    whichever bot they're talking to; a helper bot was never added to it
+    (Telegram won't even let a bot message a user who hasn't /start'ed
+    that specific bot), so picking a helper token for a DM used to fail
+    silently and fall back to an invisible server-rolled number - no dice
+    animation at all. Group chat_ids are always negative in Telegram's
+    API, private chat_ids are always positive, so that's enough to tell
+    them apart without threading chat_type through every call site."""
+    use_helper = bool(HELPER_BOT_TOKENS) and chat_id < 0
+    token = random.choice(HELPER_BOT_TOKENS) if use_helper else BOT_TOKEN
     try:
         resp = SESSION.post(f"https://api.telegram.org/bot{token}/sendDice",
                              json={"chat_id": chat_id, "emoji": "🎲"}, timeout=15)
