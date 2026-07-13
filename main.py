@@ -2836,6 +2836,11 @@ def handle_callback(callback_query):
         )
         return
 
+    if action == "db_rounds":
+        rounds, amount_s, owner_id_s = int(parts[1]), parts[2], parts[3]
+        dicebattle_confirm_rounds(chat_id, message_id, clicking_user_id, callback_id, rounds, float(amount_s), int(owner_id_s), username)
+        return
+
     if action == "dr_ou":
         mode, choice, amount_s, owner_id_s = parts[1], parts[2], parts[3], parts[4]
         _diceroll_confirm_ou(chat_id, message_id, clicking_user_id, callback_id, mode, choice, float(amount_s), int(owner_id_s), username)
@@ -5218,7 +5223,8 @@ def handle_message(message):
     # "text" at all, so this has to be checked before anything below that
     # assumes a text command.
     if message.get("dice"):
-        try_handle_diceroll_message(chat_id, user_id, message)
+        if not try_handle_diceroll_message(chat_id, user_id, message):
+            try_handle_dicebattle_message(chat_id, user_id, message)
         return
 
     uname = message["from"].get("username")
@@ -5662,6 +5668,10 @@ def handle_message(message):
             send_message(chat_id, f"✅ Broadcast complete. Sent: {sent}, Failed: {failed}.")
 
         threading.Thread(target=_run_broadcast, daemon=True).start()
+        return
+
+    if command == "/dice":
+        handle_dicebattle_command(chat_id, user_id, username, args, chat_type)
         return
 
     if command == "/clearmines":
@@ -6331,6 +6341,15 @@ DICE_DEFAULT_DIRECTION = "under"
 active_dice_games = {}   # token -> game dict
 user_active_dice = {}    # user_id -> token (one live Dice round per user)
 DICE_LOCK = threading.Lock()
+
+# /dice - "First to N" batch dice battle vs a helper bot. Distinct from
+# Lucky Roll (now /luckyroll, above) and from /diceroll's round-alternating
+# duels. Here the bot throws ALL of its N dice back-to-back up front, then
+# the player throws all N of theirs, and the higher total wins.
+active_dicebattle_games = {}  # user_id -> game dict
+DICEBATTLE_LOCK = threading.Lock()
+DICEBATTLE_HOUSE_EDGE = 0.01
+DICEBATTLE_PAYOUT = round((1 - DICEBATTLE_HOUSE_EDGE) / 0.5, 2)  # 1.98x, same 50/50 convention as the rest
 
 
 def dice_multiplier(win_chance_pct, house_edge=DICE_HOUSE_EDGE):
@@ -7427,6 +7446,189 @@ def try_handle_diceroll_message(chat_id, user_id, message):
     return True
 
 
+# =============================================================================
+# DICE BATTLE — /dice <amount>. "First to N" is really "N dice each,
+# highest total wins": pick 1, 2, or 3. The helper bot throws all N of its
+# dice back-to-back immediately, then the player throws all N of theirs
+# (one at a time, tracked). Whoever's total is higher wins DICEBATTLE_PAYOUT
+# (1.98x); an equal total is a push (bet returned, no stats win recorded).
+# =============================================================================
+
+DICEBATTLE_ROUND_EMOJI = {"vs_bot_icon": "5971808079811972376"}
+
+
+def dicebattle_rounds_keyboard(amount, user_id):
+    return {"inline_keyboard": [[
+        {"text": f"First to {n}", "callback_data": f"db_rounds:{n}:{amount}:{user_id}"}
+        for n in (1, 2, 3)
+    ]]}
+
+
+def handle_dicebattle_command(chat_id, user_id, username, args, chat_type="private"):
+    if not args:
+        send_message(
+            chat_id,
+            f"🎲 <b>Dice Battle</b> — you vs a helper bot, real Telegram dice.\n\n"
+            f"Usage: <code>/dice &lt;amount&gt;</code>\n"
+            f"Pick how many dice each side throws (1-3). The bot throws all "
+            f"its dice first, then you throw yours - highest total wins."
+        )
+        return
+
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
+        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/dice 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+        return
+    if amount < MIN_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is ${MIN_BET:.2f}")
+        return
+    if amount > MAX_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is ${MAX_BET:.2f}")
+        return
+    if user_id in active_dicebattle_games:
+        send_message(chat_id, f"{WARN_EMOJI} You already have an active Dice Battle! Finish it first.")
+        return
+    balance = get_balance(user_id)
+    if amount > balance:
+        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
+        return
+
+    send_message(
+        chat_id,
+        f"🎲 <b>Dice Battle</b> — {mention(user_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
+        f"Pick how many dice each side throws:",
+        reply_markup=dicebattle_rounds_keyboard(amount, user_id)
+    )
+
+
+def dicebattle_confirm_rounds(chat_id, message_id, clicking_user_id, callback_id, rounds, amount, owner_id, username):
+    if clicking_user_id != owner_id:
+        answer_callback(callback_id, "This isn't your bet.", show_alert=True)
+        return
+    with DICEBATTLE_LOCK:
+        if owner_id in active_dicebattle_games:
+            answer_callback(callback_id, "You already have an active Dice Battle!", show_alert=True)
+            return
+        balance = get_balance(owner_id)
+        if amount > balance:
+            answer_callback(callback_id, "Insufficient balance.", show_alert=True)
+            return
+        adjust_balance(owner_id, -amount)
+        active_dicebattle_games[owner_id] = {
+            "chat_id": chat_id, "user_id": owner_id, "username": username,
+            "amount": amount, "rounds": rounds,
+            "bot_rolls": [], "player_rolls": [], "status": "bot_throwing",
+        }
+    answer_callback(callback_id, "Locked in!")
+    edit_message(
+        chat_id, message_id,
+        f"🎲 <b>Dice Battle</b> — {mention(owner_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(owner_id, amount)}</b> · First to <b>{rounds}</b>\n\n"
+        f"🤖 Helper bot is throwing..."
+    )
+
+    def _run_bot_throws():
+        rolls = []
+        for _ in range(rounds):
+            rolls.append(send_helper_dice(chat_id))
+            time.sleep(1.2)  # let each animation land before the next throw
+        with DICEBATTLE_LOCK:
+            game = active_dicebattle_games.get(owner_id)
+            if not game or game["status"] != "bot_throwing":
+                return  # cleared/cancelled while throws were in flight
+            game["bot_rolls"] = rolls
+            game["status"] = "awaiting_player"
+        faces = " ".join(DICEROLL_FACES[r] for r in rolls)
+        send_message(
+            chat_id,
+            f"🤖 Bot rolled: {faces}  (total <b>{sum(rolls)}</b>)\n\n"
+            f"{mention(owner_id, username)}, send your 🎲 dice emoji now - "
+            f"you need <b>{rounds}</b> throw{'s' if rounds > 1 else ''}."
+        )
+
+    threading.Thread(target=_run_bot_throws, daemon=True).start()
+
+
+def try_handle_dicebattle_message(chat_id, user_id, message):
+    """Same anti-cheat check as Diceroll: reject forwarded dice, only ever
+    accept a live throw. Returns True if this dice was consumed by an
+    active Dice Battle round, False otherwise (so other handlers can try)."""
+    dice = message.get("dice")
+    if not dice or dice.get("emoji") != "🎲":
+        return False
+
+    if any(k in message for k in (
+        "forward_origin", "forward_date", "forward_from",
+        "forward_from_chat", "forward_sender_name",
+    )):
+        with DICEBATTLE_LOCK:
+            has_active = user_id in active_dicebattle_games and active_dicebattle_games[user_id]["status"] == "awaiting_player"
+        if has_active:
+            send_message(chat_id, f"{WARN_EMOJI} That's a forwarded dice, not a live throw. Send a fresh 🎲 to roll for real.")
+        return False
+
+    with DICEBATTLE_LOCK:
+        game = active_dicebattle_games.get(user_id)
+        if not game or game["chat_id"] != chat_id or game["status"] != "awaiting_player":
+            return False
+        game["player_rolls"].append(dice["value"])
+        done = len(game["player_rolls"]) >= game["rounds"]
+        if done:
+            game["status"] = "settling"
+
+    if not done:
+        remaining = game["rounds"] - len(game["player_rolls"])
+        send_message(chat_id, f"🎲 Got it! {remaining} more throw{'s' if remaining > 1 else ''} to go.")
+        return True
+
+    _dicebattle_settle(game)
+    return True
+
+
+def _dicebattle_settle(game):
+    chat_id, owner_id, username, amount = game["chat_id"], game["user_id"], game["username"], game["amount"]
+    bot_total = sum(game["bot_rolls"])
+    player_total = sum(game["player_rolls"])
+
+    with DICEBATTLE_LOCK:
+        active_dicebattle_games.pop(owner_id, None)
+
+    bot_faces = " ".join(DICEROLL_FACES[r] for r in game["bot_rolls"])
+    player_faces = " ".join(DICEROLL_FACES[r] for r in game["player_rolls"])
+    lines = (
+        f"🎲 <b>Dice Battle Result</b> — {mention(owner_id, username)}\n\n"
+        f"🤖 Bot: {bot_faces}  (total <b>{bot_total}</b>)\n"
+        f"{mention(owner_id, username)}: {player_faces}  (total <b>{player_total}</b>)\n\n"
+    )
+
+    if player_total == bot_total:
+        adjust_balance(owner_id, amount)  # push - full refund, not a stats win
+        new_balance = get_balance(owner_id)
+        send_message(chat_id, lines + f"🤝 Tie! Bet refunded.\nBalance: <b>{fmt_money(owner_id, new_balance)}</b>")
+        return
+
+    if player_total > bot_total:
+        payout = round(amount * DICEBATTLE_PAYOUT, 2)
+        adjust_balance(owner_id, payout)
+        new_balance = get_balance(owner_id)
+        send_message(
+            chat_id,
+            lines + f"🏆 You win! Payout: <b>{fmt_money(owner_id, payout)}</b>\n"
+            f"Balance: <b>{fmt_money(owner_id, new_balance)}</b>"
+        )
+    else:
+        new_balance = get_balance(owner_id)
+        send_message(
+            chat_id,
+            lines + f"❌ Bot wins. Lost: <b>{fmt_money(owner_id, amount)}</b>\n"
+            f"Balance: <b>{fmt_money(owner_id, new_balance)}</b>"
+        )
+
+
 # ---------------------------------------------------------------------------
 # DB SYNC — every active-game dict in this file (Mines/Towers/Keno are
 # keyed by user_id; Crash/Blackjack/Dice/ChickenRoad are keyed by a token,
@@ -7633,6 +7835,7 @@ def main():
             {"command": "blackjack", "description": "Play Blackjack"},
             {"command": "luckyroll", "description": "Play Lucky Roll (dice)"},
             {"command": "diceroll", "description": "Real 🎲 dice games: OE/HL/1v1/Crazy/Predict"},
+            {"command": "dice", "description": "Dice Battle: N dice each vs a helper bot, highest total wins"},
             {"command": "crash", "description": "Play Crash"},
             {"command": "chickenroad", "description": "Play Chicken Road"},
             {"command": "roulette", "description": "Play Roulette"},
