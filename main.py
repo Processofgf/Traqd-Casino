@@ -287,6 +287,25 @@ CRASH_LOCK = threading.Lock()
 CLIENT_SEED_LOCK = threading.Lock()
 FAIR_LOCK = threading.Lock()
 
+
+def _mines_finish_cleanup(owner_id):
+    """Removes a finished Mines game (bomb hit / board cleared / cashed out)
+    from memory AND immediately deletes its row from Postgres, instead of
+    leaving that DB row to be cleaned up by periodic_db_sync_loop()'s
+    full-cleanup pass (which only runs every ~20s). Without this, a restart
+    that lands inside that ~20s window reloads the already-finished game
+    back into active_mines_games on startup, and the player's very next bet
+    wrongly fails with "you already have an active Mines game"."""
+    with MINES_LOCK:
+        active_mines_games.pop(owner_id, None)
+    if DB_ENABLED:
+        try:
+            db.delete_game("mines", str(owner_id))
+        except Exception as e:
+            print(f"⚠️ Could not delete finished mines game from DB: {e}")
+    _last_synced_game_snapshot.setdefault("mines", {}).pop(str(owner_id), None)
+
+
 # ---------------------------------------------------------------------------
 # WALLET — real (withdrawable) balance vs. bonus (wager-locked) balance.
 #
@@ -3004,8 +3023,7 @@ def handle_callback(callback_query):
         if idx in mine_positions:
             answer_callback(callback_id, "💥 BOOM!")
             record_bet_result(owner_id, username, "Mines", amount, 0.0)
-            with MINES_LOCK:
-                active_mines_games.pop(owner_id, None)
+            _mines_finish_cleanup(owner_id)
 
             new_balance = get_balance(owner_id)
             revealed_count = len(game["revealed"])
@@ -3038,8 +3056,7 @@ def handle_callback(callback_query):
             adjust_balance(owner_id, payout)
             broadcast_win(owner_id, username, "Mines", amount, payout, detail=f"Cleared the board · {bomb_count} mines")
             record_bet_result(owner_id, username, "Mines", amount, payout)
-            with MINES_LOCK:
-                active_mines_games.pop(owner_id, None)
+            _mines_finish_cleanup(owner_id)
             new_balance = get_balance(owner_id)
             edit_message(
                 chat_id, message_id,
@@ -3098,8 +3115,7 @@ def handle_callback(callback_query):
         adjust_balance(owner_id, payout)
         broadcast_win(owner_id, username, "Mines", amount, payout, detail=f"Cashed out · {bomb_count} mines, {revealed_count} tiles")
         record_bet_result(owner_id, username, "Mines", amount, payout)
-        with MINES_LOCK:
-            active_mines_games.pop(owner_id, None)
+        _mines_finish_cleanup(owner_id)
 
         new_balance = get_balance(owner_id)
         answer_callback(callback_id, f"Cashed out {multiplier:g}x!")
