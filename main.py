@@ -157,6 +157,7 @@ def _offset_writer_loop():
     as soon as set_telegram_offset() has something new to persist, writes
     only the latest value (older, already-superseded values in the same
     burst are skipped), then goes back to waiting."""
+    global _offset_dirty
     while True:
         _offset_write_event.wait()
         _offset_write_event.clear()
@@ -5671,6 +5672,8 @@ def handle_message(message):
         return
 
     if command == "/dice":
+        username = message["from"].get("first_name", "Player")
+        chat_type = message["chat"].get("type", "private")
         handle_dicebattle_command(chat_id, user_id, username, args, chat_type)
         return
 
