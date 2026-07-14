@@ -1485,8 +1485,8 @@ def build_stats_card(user_id, username, handle=None):
     H = 1800
 
     # ---- Trading-vibe background: vivid diagonal green->red gradient ----
-    GREEN_VIVID = (16, 92, 58)
-    RED_VIVID = (110, 22, 30)
+    GREEN_VIVID = (28, 138, 88)
+    RED_VIVID = (168, 36, 46)
     grad_res = 72
     grad_small = Image.new("RGB", (grad_res, grad_res))
     gp = grad_small.load()
@@ -1498,10 +1498,36 @@ def build_stats_card(user_id, username, handle=None):
 
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
-    gd.ellipse([W * 0.5, -H * 0.1, W * 1.3, H * 0.25], fill=(*GREEN, 110))
-    gd.ellipse([-W * 0.35, H * 0.68, W * 0.55, H * 1.1], fill=(*RED, 110))
+    gd.ellipse([W * 0.5, -H * 0.1, W * 1.3, H * 0.25], fill=(*GREEN, 150))
+    gd.ellipse([-W * 0.35, H * 0.68, W * 0.55, H * 1.1], fill=(*RED, 150))
     glow = glow.filter(ImageFilter.GaussianBlur(140))
     bg = Image.alpha_composite(bg.convert("RGBA"), glow)
+
+    # ---- Decorative candlestick chart texture (stock-market vibe) ----
+    candle_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    cd = ImageDraw.Draw(candle_layer)
+    rng = random.Random(user_id)  # stable per-user pattern across regenerations
+    n_candles = 46
+    candle_w = W / n_candles
+    baseline = H * 0.5
+    amplitude = H * 0.16
+    price = 0.0
+    for idx in range(n_candles):
+        step = rng.uniform(-1, 1) * amplitude * 0.5
+        open_p, close_p = price, price + step
+        high_p = max(open_p, close_p) + rng.uniform(0, amplitude * 0.22)
+        low_p = min(open_p, close_p) - rng.uniform(0, amplitude * 0.22)
+        price = close_p
+        cx = idx * candle_w + candle_w / 2
+        y_open, y_close = baseline - open_p, baseline - close_p
+        y_high, y_low = baseline - high_p, baseline - low_p
+        wick_color = (255, 255, 255, 46)
+        body_color = (200, 230, 210, 42) if close_p >= open_p else (240, 200, 200, 42)
+        cd.line([(cx, y_high), (cx, y_low)], fill=wick_color, width=2)
+        body_top, body_bottom = min(y_open, y_close), max(y_open, y_close)
+        body_w = candle_w * 0.5
+        cd.rectangle([cx - body_w / 2, body_top, cx + body_w / 2, max(body_bottom, body_top + 3)], fill=body_color)
+    bg = Image.alpha_composite(bg, candle_layer)
     draw = ImageDraw.Draw(bg)
 
     margin = 56
@@ -1529,21 +1555,21 @@ def build_stats_card(user_id, username, handle=None):
     draw.ellipse([avatar_box[0] - 4, avatar_box[1] - 4, avatar_box[2] + 4, avatar_box[3] + 4], outline=RED, width=5)
 
     name_x = avatar_box[2] + 30
-    font_name = _load_font(46, bold=True)
+    font_name = _load_font(56, bold=True)
     name_text = username or "Player"
-    draw.text((name_x, 78), name_text, font=font_name, fill=WHITE)
+    draw.text((name_x, 74), name_text, font=font_name, fill=WHITE)
     if handle:
-        font_handle = _load_font(30, bold=True)
-        draw.text((name_x, 132), f"@{handle}", font=font_handle, fill=RED)
+        font_handle = _load_font(36, bold=True)
+        draw.text((name_x, 144), f"@{handle}", font=font_handle, fill=RED)
 
     brand = "TRAQD CASINO"
-    font_brand = _load_font(30, bold=True)
+    font_brand = _load_font(36, bold=True)
     brand_bb = draw.textbbox((0, 0), brand, font=font_brand)
-    draw.text((W - margin - (brand_bb[2] - brand_bb[0]), 78), brand, font=font_brand, fill=RED)
-    font_tag = _load_font(22)
+    draw.text((W - margin - (brand_bb[2] - brand_bb[0]), 74), brand, font=font_brand, fill=RED)
+    font_tag = _load_font(24)
     tag = "Play Responsibly"
     tag_bb = draw.textbbox((0, 0), tag, font=font_tag)
-    draw.text((W - margin - (tag_bb[2] - tag_bb[0]), 118), tag, font=font_tag, fill=MUTED)
+    draw.text((W - margin - (tag_bb[2] - tag_bb[0]), 122), tag, font=font_tag, fill=MUTED)
 
     # ---- Pill row: ID, tier, rank, streak ----
     pill_y = avatar_box[3] + 26
