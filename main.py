@@ -1477,19 +1477,30 @@ def build_stats_card(user_id, username, handle=None):
     RED = (240, 95, 100)
     MUTED = (150, 148, 168)
     WHITE = (247, 246, 250)
-    CARD_BORDER = (255, 255, 255, 26)
-    CARD_FILL = (255, 255, 255, 16)
+    CARD_BORDER = (255, 255, 255, 36)
+    CARD_FILL = (8, 8, 14, 130)
 
     # Generous initial canvas height - cropped to the real content height
     # at the very end, since the table height varies with game count.
     H = 1800
 
-    bg = Image.new("RGB", (W, H), BLACK)
+    # ---- Trading-vibe background: vivid diagonal green->red gradient ----
+    GREEN_VIVID = (16, 92, 58)
+    RED_VIVID = (110, 22, 30)
+    grad_res = 72
+    grad_small = Image.new("RGB", (grad_res, grad_res))
+    gp = grad_small.load()
+    for j in range(grad_res):
+        for i in range(grad_res):
+            t = (i / (grad_res - 1) + j / (grad_res - 1)) / 2.0
+            gp[i, j] = tuple(int(GREEN_VIVID[k] + (RED_VIVID[k] - GREEN_VIVID[k]) * t) for k in range(3))
+    bg = grad_small.resize((W, H), Image.BILINEAR)
+
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
-    gd.ellipse([W * 0.55, -H * 0.05, W * 1.25, H * 0.18], fill=(*BLUE_NEON, 60))
-    gd.ellipse([-W * 0.35, H * 0.75, W * 0.45, H * 1.05], fill=(*RED, 35))
-    glow = glow.filter(ImageFilter.GaussianBlur(120))
+    gd.ellipse([W * 0.5, -H * 0.1, W * 1.3, H * 0.25], fill=(*GREEN, 110))
+    gd.ellipse([-W * 0.35, H * 0.68, W * 0.55, H * 1.1], fill=(*RED, 110))
+    glow = glow.filter(ImageFilter.GaussianBlur(140))
     bg = Image.alpha_composite(bg.convert("RGBA"), glow)
     draw = ImageDraw.Draw(bg)
 
@@ -5538,7 +5549,8 @@ def handle_message(message):
     # assumes a text command.
     if message.get("dice"):
         if not try_handle_diceroll_message(chat_id, user_id, message):
-            try_handle_dicebattle_message(chat_id, user_id, message)
+            if not try_handle_dicebattle_message(chat_id, user_id, message):
+                try_handle_darts_message(chat_id, user_id, message)
         return
 
     uname = message["from"].get("username")
@@ -5850,6 +5862,8 @@ def handle_message(message):
             f"/luckyroll &lt;amount&gt; — roll under/over your target\n"
             f"/diceroll — real 🎲 dice games: Odd/Even, High/Low, Prediction, "
             f"1v1, Crazy Mode (send /diceroll alone for the full syntax)\n"
+            f"/darts &lt;amount&gt; — real 🎯 dart throw: bullseye (6) pays 2x, "
+            f"on the board (2-5) pays 0.5x, miss (1) loses\n"
             f"/coinflip &lt;amount&gt; &lt;heads|tails&gt; — 50/50, straight up\n"
             f"/limbo &lt;amount&gt; &lt;target&gt; — pick a multiplier, beat it "
             f"or lose\n"
@@ -6195,6 +6209,12 @@ def handle_message(message):
         username = message["from"].get("first_name", "Player")
         chat_type = message["chat"].get("type", "private")
         handle_diceroll_command(chat_id, user_id, username, args, chat_type)
+        return
+
+    if command == "/darts":
+        username = message["from"].get("first_name", "Player")
+        chat_type = message["chat"].get("type", "private")
+        handle_darts_command(chat_id, user_id, username, args, chat_type)
         return
 
     if command == "/deposit":
@@ -7775,11 +7795,150 @@ def try_handle_diceroll_message(chat_id, user_id, message):
 
 
 # =============================================================================
-# DICE BATTLE — /dice <amount>. "First to N" is really "N dice each,
-# highest total wins": pick 1, 2, or 3. The helper bot throws all N of its
-# dice back-to-back immediately, then the player throws all N of theirs
-# (one at a time, tracked). Whoever's total is higher wins DICEBATTLE_PAYOUT
-# (1.98x); an equal total is a push (bet returned, no stats win recorded).
+# DARTS — /darts <amount>. A real Telegram 🎯 throw, same trust model as
+# Diceroll: the player sends the dart emoji themselves, Telegram animates
+# and picks the value server-side (1-6), we just read message["dice"]["value"].
+#
+# Per Telegram's own (undocumented but stable) dartboard semantics: 1 means
+# the board was missed entirely, 6 is a bullseye, 2-5 land somewhere on the
+# board in between. Payout table (deliberately picked, NOT the ~1% edge used
+# everywhere else in this file - confirmed with the bot owner):
+#   1 (missed board) -> 0x   (lose stake)
+#   2-5 (hit, off-center)  -> 0.5x  (lose half the stake)
+#   6 (bullseye)      -> 2x   (double up)
+# Expected return = (0 + 0.5*4 + 2) / 6 = 0.667 of stake -> ~33% house edge.
+# =============================================================================
+
+DARTS_PAYOUTS = {1: 0.0, 2: 0.5, 3: 0.5, 4: 0.5, 5: 0.5, 6: 2.0}
+
+DARTS_LOCK = threading.Lock()
+active_darts_games = {}   # user_id -> game dict
+user_active_darts = {}    # user_id -> True while a round is awaiting a throw (kept for symmetry/clarity)
+
+
+def handle_darts_command(chat_id, user_id, username, args, chat_type="private"):
+    if not args:
+        send_message(
+            chat_id,
+            f"🎯 <b>Darts</b> — real Telegram dart throw, you throw it yourself.\n\n"
+            f"1 (missed board) = lose stake · 2-5 (on the board) = 0.5x · "
+            f"6 (bullseye) = <b>2x</b>\n\n"
+            f"Usage: <code>/darts &lt;amount&gt;</code>\nExample: <code>/darts 10</code> or <code>/darts all</code>"
+        )
+        return
+
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
+        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/darts 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+        return
+
+    if amount < MIN_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
+        return
+    if amount > MAX_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
+        return
+
+    if user_id in user_active_darts:
+        send_message(chat_id, f"{WARN_EMOJI} You already have an active Darts round! Throw your dart first.")
+        return
+
+    with DARTS_LOCK:
+        if user_id in user_active_darts:
+            send_message(chat_id, f"{WARN_EMOJI} You already have an active Darts round! Throw your dart first.")
+            return
+        balance = get_balance(user_id)
+        if amount > balance:
+            send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
+            return
+        adjust_balance(user_id, -amount)
+        active_darts_games[user_id] = {
+            "chat_id": chat_id, "user_id": user_id, "username": username,
+            "amount": amount, "status": "awaiting_throw",
+        }
+        user_active_darts[user_id] = True
+
+    send_message(
+        chat_id,
+        f"🎯 <b>Darts</b> — {mention(user_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
+        f"🎯 Send the dart emoji now to throw!"
+    )
+
+
+def darts_cleanup(user_id):
+    with DARTS_LOCK:
+        active_darts_games.pop(user_id, None)
+        user_active_darts.pop(user_id, None)
+
+
+def try_handle_darts_message(chat_id, user_id, message):
+    """Called from handle_message for any incoming message that contains a
+    real Telegram dart throw. Returns True if it belonged to (and was
+    consumed by) an active Darts round, False otherwise."""
+    dice = message.get("dice")
+    if not dice or dice.get("emoji") != "🎯":
+        return False
+
+    # Same anti-cheat as Diceroll: reject forwarded dice, only accept a live throw.
+    if any(k in message for k in (
+        "forward_origin", "forward_date", "forward_from",
+        "forward_from_chat", "forward_sender_name",
+    )):
+        with DARTS_LOCK:
+            has_active_round = user_id in active_darts_games and active_darts_games[user_id]["chat_id"] == chat_id
+        if has_active_round:
+            send_message(chat_id, f"{WARN_EMOJI} That's a forwarded dart, not a live throw. Send a fresh 🎯 to throw for real.")
+        return False
+
+    with DARTS_LOCK:
+        game = active_darts_games.get(user_id)
+        if not game or game["chat_id"] != chat_id or game["status"] != "awaiting_throw":
+            return False
+
+    value = dice["value"]
+    darts_cleanup(user_id)
+
+    username, amount = game["username"], game["amount"]
+    multiplier = DARTS_PAYOUTS.get(value, 0.0)
+    payout = round(amount * multiplier, 2)
+    record_bet_result(user_id, username, "Darts", amount, payout)
+
+    if value == 6:
+        result_line = f"🎯 <b>BULLSEYE!</b> Dart value: {value}"
+    elif value == 1:
+        result_line = f"💨 <b>Missed the board!</b> Dart value: {value}"
+    else:
+        result_line = f"🎯 On the board. Dart value: {value}"
+
+    if payout > 0:
+        adjust_balance(user_id, payout)
+        if value == 6:
+            broadcast_win(user_id, username, "Darts", amount, payout, detail="Bullseye!")
+    new_balance = get_balance(user_id)
+
+    if payout > amount:
+        outcome = f"{cemoji('trophy')} <b>You won {fmt_money(user_id, payout)}!</b> ({multiplier:g}x)"
+    elif payout > 0:
+        outcome = f"You got {fmt_money(user_id, payout)} back. ({multiplier:g}x)"
+    else:
+        outcome = f"{WARN_EMOJI} You lost {fmt_money(user_id, amount)}."
+
+    send_message(
+        chat_id,
+        f"🎯 <b>Darts</b> — {mention(user_id, username)}\n\n"
+        f"{result_line}\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n"
+        f"{outcome}\n\n"
+        f"Balance: <b>{fmt_money(user_id, new_balance)}</b>"
+    )
+    return True
+
+
+
 # =============================================================================
 
 DICEBATTLE_ROUND_EMOJI = {"vs_bot_icon": "5971808079811972376"}
