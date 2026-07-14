@@ -187,7 +187,7 @@ def fetch_bot_username():
     return BOT_USERNAME
 
 STARTING_BALANCE = 0.00
-MIN_BET = 0.10
+MIN_BET = 0.53      # ≈ ₹50 at ₹95/$1
 MAX_BET = 100.00
 
 MIN_DEPOSIT = 3.00
