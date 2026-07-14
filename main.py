@@ -6063,6 +6063,47 @@ def handle_message(message):
         )
         return
 
+    if command == "/admindeposit":
+        # Admin-only, deliberately NOT listed in /help or the command menu.
+        # Unlike /testfund (locked, non-withdrawable, auto-wiped test money),
+        # this credits REAL, withdrawable balance - exactly like a genuine
+        # deposit would, including the normal 1x deposit-wager requirement.
+        # Reply to someone's message to credit them instead of yourself.
+        if not is_admin(user_id):
+            return
+        if not args:
+            send_message(chat_id, f"{WARN_EMOJI} Usage: <code>/admindeposit 50</code> (credits yourself), or reply to someone's message with <code>/admindeposit 50</code> to credit them.")
+            return
+        try:
+            credit_amount = round(float(args[0]), 2)
+        except ValueError:
+            send_message(chat_id, f"{WARN_EMOJI} Please give a plain number, e.g. <code>/admindeposit 50</code>")
+            return
+        if credit_amount <= 0:
+            send_message(chat_id, f"{WARN_EMOJI} Amount must be greater than $0.")
+            return
+
+        target_id = user_id
+        target_name = message["from"].get("first_name", "Player")
+        reply_msg = message.get("reply_to_message")
+        if reply_msg and reply_msg.get("from") and not reply_msg["from"].get("is_bot"):
+            target_id = reply_msg["from"]["id"]
+            target_name = reply_msg["from"].get("first_name", "Player")
+
+        adjust_balance(target_id, credit_amount)
+        record_deposit(target_id, credit_amount)
+        wager_total = _apply_deposit_wager_requirement(target_id, credit_amount)
+        new_balance = get_balance(target_id)
+
+        send_message(
+            chat_id,
+            f"{cemoji('money')} Credited <b>${credit_amount:.2f}</b> real balance to {mention(target_id, target_name)} "
+            f"(as if from a deposit).\n"
+            f"Wager <b>${wager_total:.2f}</b> total (1× that amount) before this real balance can be withdrawn.\n\n"
+            f"New balance: <b>{fmt_money(target_id, new_balance)}</b>"
+        )
+        return
+
     if command == "/testfund":
         # Admin-only, deliberately NOT listed in /help or the command menu.
         # Grants play-money for testing games - it's added to the bonus
