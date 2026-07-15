@@ -2714,7 +2714,7 @@ def _process_stars_deposit_amount(chat_id, user_id, username, text):
     result = send_invoice(
         chat_id=chat_id,
         title="Traqd Casino - Star Deposit",
-        description=f"Deposit {stars} Telegram Stars (₹{inr_amount:.0f} ≈ ${usd_amount:.2f} balance)",
+        description=f"Deposit {stars} Telegram Stars (≈ ${usd_amount:.2f} balance)",
         payload=invoice_payload,
         currency="XTR",
         prices=[{"label": f"{stars} Stars", "amount": stars}],
@@ -2979,13 +2979,11 @@ def handle_deposit_callback(callback_id, chat_id, user_id, username, coin):
 def handle_deposit_stars_callback(callback_id, chat_id, user_id, username):
     answer_callback(callback_id)
     _set_deposit_flow(user_id, {"coin": "STARS"})
-    min_inr = MIN_STARS_DEPOSIT * STAR_TO_INR_RATE
-    min_usd = round(min_inr / FIXED_USD_INR_RATE, 2)
+    min_usd = round(MIN_STARS_DEPOSIT * STAR_TO_INR_RATE / FIXED_USD_INR_RATE, 2)
     send_message(
         chat_id,
         f"⭐ <b>Telegram Stars Deposit</b>\n\n"
-        f"Rate: <b>1 ⭐ = ₹{STAR_TO_INR_RATE:g}</b>\n"
-        f"Minimum: <b>{MIN_STARS_DEPOSIT} ⭐</b> (₹{min_inr:.0f} ≈ ${min_usd:.2f})\n\n"
+        f"Minimum: <b>{MIN_STARS_DEPOSIT} ⭐</b> (≈ ${min_usd:.2f})\n\n"
         f"Reply with how many Stars you want to deposit.\n"
         f"Example: <code>{MIN_STARS_DEPOSIT}</code>"
     )
