@@ -3214,15 +3214,114 @@ def handle_callback(callback_query):
         )
         return
 
+    if action == "dr_cat":
+        category, amount_s, owner_id_s = parts[1], parts[2], parts[3]
+        owner_id = int(owner_id_s)
+        amount = float(amount_s)
+        if clicking_user_id != owner_id:
+            answer_callback(callback_id, "🚫 This isn't your bet! Start your own with /diceroll <amount>")
+            return
+        if owner_id in user_active_diceroll:
+            answer_callback(callback_id, f"{WARN_EMOJI} You already have an active Diceroll round!", show_alert=True)
+            return
+        answer_callback(callback_id)
+        if category == "normal":
+            edit_message(
+                chat_id, message_id,
+                f"🎲 <b>Diceroll — Normal</b> — {mention(owner_id, username)}\n\n"
+                f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n\n"
+                f"Choose a game:",
+                reply_markup=diceroll_normal_menu_keyboard(amount, owner_id)
+            )
+        elif category == "crazy":
+            _diceroll_prompt_duel_opponent(chat_id, owner_id, username, amount, crazy=True, message_id=message_id)
+        elif category == "pvp":
+            _diceroll_prompt_duel_opponent(chat_id, owner_id, username, amount, crazy=False, message_id=message_id)
+        return
+
+    if action == "dr_pickmode":
+        mode, amount_s, owner_id_s = parts[1], parts[2], parts[3]
+        owner_id = int(owner_id_s)
+        amount = float(amount_s)
+        if clicking_user_id != owner_id:
+            answer_callback(callback_id, "🚫 This isn't your bet! Start your own with /diceroll <amount>")
+            return
+        answer_callback(callback_id)
+        if mode == "predict":
+            edit_message(
+                chat_id, message_id,
+                f'<tg-emoji emoji-id="5298736754059138615">🎯</tg-emoji> <b>Diceroll Prediction</b> — {mention(owner_id, username)}\n\n'
+                f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n\n"
+                f"Pick up to 3 numbers, then hit Confirm:",
+                reply_markup=diceroll_predict_keyboard(amount, owner_id, [])
+            )
+        else:
+            pretty = "Odd/Even" if mode == "oe" else "High/Low"
+            if mode == "oe":
+                buttons = [[
+                    {"text": "Odd (1,3,5)", "callback_data": f"dr_ou:{mode}:odd:{amount}:{owner_id}", "style": "primary"},
+                    {"text": "Even (2,4,6)", "callback_data": f"dr_ou:{mode}:even:{amount}:{owner_id}", "style": "primary"},
+                ]]
+            else:
+                buttons = [[
+                    {"text": "High (4-6)", "callback_data": f"dr_ou:{mode}:high:{amount}:{owner_id}", "icon_custom_emoji_id": "5449683594425410231", "style": "primary"},
+                    {"text": "Low (1-3)", "callback_data": f"dr_ou:{mode}:low:{amount}:{owner_id}", "icon_custom_emoji_id": "5447183459602669338", "style": "primary"},
+                ]]
+            edit_message(
+                chat_id, message_id,
+                f"{DICEROLL_MODE_EMOJI[mode]} <b>Diceroll {pretty}</b> — {mention(owner_id, username)}\n\n"
+                f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n\n"
+                f"Pick one:",
+                reply_markup={"inline_keyboard": buttons}
+            )
+        return
+
+    if action == "dr_cancel":
+        owner_id = int(parts[1])
+        if clicking_user_id != owner_id:
+            answer_callback(callback_id, "🚫 This isn't your bet!")
+            return
+        answer_callback(callback_id, "Cancelled.")
+        edit_message(chat_id, message_id, "❌ Bet cancelled. Run /diceroll to start again.")
+        return
+
     if action == "db_rounds":
         rounds, amount_s, owner_id_s = int(parts[1]), parts[2], parts[3]
         dicebattle_confirm_rounds(chat_id, message_id, clicking_user_id, callback_id, rounds, float(amount_s), int(owner_id_s), username)
         return
 
     if action == "dr_ou":
+        # Player just picked High/Low or Odd/Even - show a confirmation
+        # screen before touching their balance. Nothing is deducted here;
+        # dr_ou_confirm below does the actual deduct + round start.
+        mode, choice, amount_s, owner_id_s = parts[1], parts[2], parts[3], parts[4]
+        amount = float(amount_s)
+        owner_id = int(owner_id_s)
+        if clicking_user_id != owner_id:
+            answer_callback(callback_id, "🚫 This isn't your bet! Start your own with /diceroll <amount>")
+            return
+        answer_callback(callback_id)
+        pretty = "Odd/Even" if mode == "oe" else "High/Low"
+        potential_payout = round(amount * DICEROLL_OU_PAYOUT, 2)
+        edit_message(
+            chat_id, message_id,
+            f"{DICEROLL_MODE_EMOJI[mode]} <b>Diceroll {pretty}</b> — {mention(owner_id, username)}\n\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n"
+            f"Your call: <b>{choice.title()}</b>\n"
+            f"Payout if you win: <b>{fmt_money(owner_id, potential_payout)}</b> ({DICEROLL_OU_PAYOUT:g}x)\n\n"
+            f"Confirm your bet?",
+            reply_markup={"inline_keyboard": [[
+                {"text": "✅ Confirm", "callback_data": f"dr_ou_confirm:{mode}:{choice}:{amount}:{owner_id}", "style": "primary"},
+                {"text": "❌ Cancel", "callback_data": f"dr_cancel:{owner_id}", "style": "primary"},
+            ]]}
+        )
+        return
+
+    if action == "dr_ou_confirm":
         mode, choice, amount_s, owner_id_s = parts[1], parts[2], parts[3], parts[4]
         _diceroll_confirm_ou(chat_id, message_id, clicking_user_id, callback_id, mode, choice, float(amount_s), int(owner_id_s), username)
         return
+
 
     if action == "dr_pnum":
         n, amount_s, picks_csv, owner_id_s = int(parts[1]), parts[2], parts[3], parts[4]
@@ -7187,6 +7286,85 @@ def diceroll_menu_keyboard():
     ]}
 
 
+def diceroll_amount_menu_keyboard(amount, owner_id):
+    """Top-level picker shown right after /diceroll <amount> - Normal
+    (High/Low, Odd/Even, Prediction), Crazy Mode, or PvP (1v1)."""
+    return {"inline_keyboard": [
+        [{"text": "Normal", "callback_data": f"dr_cat:normal:{amount}:{owner_id}", "style": "primary"}],
+        [{"text": "Crazy Mode", "callback_data": f"dr_cat:crazy:{amount}:{owner_id}", "style": "primary"}],
+        [{"text": "PvP (1v1)", "callback_data": f"dr_cat:pvp:{amount}:{owner_id}", "style": "primary"}],
+    ]}
+
+
+def diceroll_normal_menu_keyboard(amount, owner_id):
+    return {"inline_keyboard": [
+        [{"text": "High/Low", "callback_data": f"dr_pickmode:hl:{amount}:{owner_id}", "style": "primary"},
+         {"text": "Odd/Even", "callback_data": f"dr_pickmode:oe:{amount}:{owner_id}", "style": "primary"}],
+        [{"text": "Prediction", "callback_data": f"dr_pickmode:predict:{amount}:{owner_id}", "style": "primary"}],
+    ]}
+
+
+def _diceroll_start_amount_menu(chat_id, user_id, username, args):
+    """Entry point for the /dr <amount> shortcut - validates the amount up
+    front (same checks every mode does individually), then shows the
+    Normal / Crazy / PvP picker. Nothing is deducted here - that only
+    happens once the player has drilled all the way down to a specific
+    bet and confirmed it."""
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
+        send_message(
+            chat_id,
+            f"{WARN_EMOJI} Unknown mode or invalid amount. Run <code>/diceroll</code> with no "
+            f"arguments to see all modes, or <code>/diceroll &lt;amount&gt;</code> to start."
+        )
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+        return
+    if amount < MIN_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
+        return
+    if amount > MAX_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
+        return
+    if user_id in user_active_diceroll:
+        send_message(chat_id, f"{WARN_EMOJI} You already have an active Diceroll round! Finish it first.")
+        return
+    balance = get_balance(user_id)
+    if amount > balance:
+        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
+        return
+
+    send_message(
+        chat_id,
+        f"🎲 <b>Diceroll</b> — {mention(user_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
+        f"Choose a mode:",
+        reply_markup=diceroll_amount_menu_keyboard(amount, user_id)
+    )
+
+
+def _diceroll_prompt_duel_opponent(chat_id, owner_id, username, amount, crazy, message_id=None):
+    """Shows the 'vs Bot / Open Challenge' picker for Crazy Mode or PvP.
+    Edits message_id in place if given (coming from a callback), otherwise
+    sends a fresh message (coming from the text-command fast path)."""
+    cflag = "1" if crazy else "0"
+    pretty = "Crazy Mode (lowest wins)" if crazy else "1v1"
+    buttons = [[
+        {"text": "vs Bot", "callback_data": f"dr_duelopp:{cflag}:{amount}:bot:{owner_id}", "icon_custom_emoji_id": "5971808079811972376", "style": "primary"},
+        {"text": "Open Challenge", "callback_data": f"dr_duelopp:{cflag}:{amount}:open:{owner_id}", "style": "primary"},
+    ]]
+    text = (
+        f"{DICEROLL_MODE_EMOJI['crazy' if crazy else '1v1']} <b>Diceroll {pretty}</b> — {mention(owner_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n\n"
+        f"Who's your opponent?"
+    )
+    if message_id is not None:
+        edit_message(chat_id, message_id, text, reply_markup={"inline_keyboard": buttons})
+    else:
+        send_message(chat_id, text, reply_markup={"inline_keyboard": buttons})
+
+
 def handle_diceroll_command(chat_id, user_id, username, args, chat_type="private"):
     if not args:
         send_message(
@@ -7206,6 +7384,12 @@ def handle_diceroll_command(chat_id, user_id, username, args, chat_type="private
 
     sub = args[0].lower()
     rest = args[1:]
+
+    KNOWN_DR_SUBCOMMANDS = {"oe", "oddeven", "hl", "highlow", "predict", "pred", "1v1", "crazy", "join"}
+    if sub not in KNOWN_DR_SUBCOMMANDS:
+        # /dr <amount> shortcut - show the Normal / Crazy Mode / PvP picker
+        _diceroll_start_amount_menu(chat_id, user_id, username, args)
+        return
 
     if sub in ("oe", "oddeven"):
         _diceroll_start_ou(chat_id, user_id, username, rest, mode="oe")
@@ -7298,13 +7482,13 @@ def _diceroll_start_ou(chat_id, user_id, username, args, mode):
     pretty = "Odd/Even" if mode == "oe" else "High/Low"
     if mode == "oe":
         buttons = [[
-            {"text": "🔵 Odd (1,3,5)", "callback_data": f"dr_ou:{mode}:odd:{amount}:{user_id}"},
-            {"text": "🟠 Even (2,4,6)", "callback_data": f"dr_ou:{mode}:even:{amount}:{user_id}"},
+            {"text": "Odd (1,3,5)", "callback_data": f"dr_ou:{mode}:odd:{amount}:{user_id}", "style": "primary"},
+            {"text": "Even (2,4,6)", "callback_data": f"dr_ou:{mode}:even:{amount}:{user_id}", "style": "primary"},
         ]]
     else:
         buttons = [[
-            {"text": "High (4-6)", "callback_data": f"dr_ou:{mode}:high:{amount}:{user_id}", "icon_custom_emoji_id": "5449683594425410231"},
-            {"text": "Low (1-3)", "callback_data": f"dr_ou:{mode}:low:{amount}:{user_id}", "icon_custom_emoji_id": "5447183459602669338"},
+            {"text": "High (4-6)", "callback_data": f"dr_ou:{mode}:high:{amount}:{user_id}", "icon_custom_emoji_id": "5449683594425410231", "style": "primary"},
+            {"text": "Low (1-3)", "callback_data": f"dr_ou:{mode}:low:{amount}:{user_id}", "icon_custom_emoji_id": "5447183459602669338", "style": "primary"},
         ]]
 
     send_message(
@@ -7461,13 +7645,13 @@ def diceroll_predict_keyboard(amount, user_id, selected):
     picks_csv = ",".join(str(n) for n in selected)
     row1, row2 = [], []
     for n in range(1, 7):
-        btn = {"text": f"{DICEROLL_FACES[n]} {n}", "callback_data": f"dr_pnum:{n}:{amount}:{picks_csv}:{user_id}"}
+        btn = {"text": f"{DICEROLL_FACES[n]} {n}", "callback_data": f"dr_pnum:{n}:{amount}:{picks_csv}:{user_id}", "style": "primary"}
         if n in selected:
             btn["icon_custom_emoji_id"] = "5424998570539373838"
         (row1 if n <= 3 else row2).append(btn)
     rows = [row1, row2]
     if selected:
-        rows.append([{"text": f"Confirm ({diceroll_predict_payout(len(selected)):g}x)", "callback_data": f"dr_pconfirm:{amount}:{picks_csv}:{user_id}", "icon_custom_emoji_id": "5424998570539373838"}])
+        rows.append([{"text": f"Confirm ({diceroll_predict_payout(len(selected)):g}x)", "callback_data": f"dr_pconfirm:{amount}:{picks_csv}:{user_id}", "icon_custom_emoji_id": "5424998570539373838", "style": "primary"}])
     return {"inline_keyboard": rows}
 
 
@@ -7591,28 +7775,16 @@ def _diceroll_start_duel(chat_id, user_id, username, args, chat_type, crazy):
                 f"{DICEROLL_MODE_EMOJI['crazy' if crazy else '1v1']} <b>Diceroll {pretty}</b> — {mention(user_id, username)} is challenging the group!\n\n"
                 f"Bet: <b>{fmt_money(user_id, amount)}</b> each · First to <b>{first_to}</b>\n\n"
                 f"Tap below to accept (needs the same balance):",
-                reply_markup={"inline_keyboard": [[{"text": "Join Challenge", "callback_data": "dr_join", "icon_custom_emoji_id": "5424998570539373838"}]]}
+                reply_markup={"inline_keyboard": [[{"text": "Join Challenge", "callback_data": "dr_join", "icon_custom_emoji_id": "5424998570539373838", "style": "primary"}]]}
             )
         return
 
-    cflag = "1" if crazy else "0"
-    pretty = "Crazy Mode (lowest wins)" if crazy else "1v1"
-    buttons = [[
-        {"text": "vs Bot", "callback_data": f"dr_duelopp:{cflag}:{amount}:bot:{user_id}", "icon_custom_emoji_id": "5971808079811972376"},
-        {"text": "👥 Open Challenge", "callback_data": f"dr_duelopp:{cflag}:{amount}:open:{user_id}"},
-    ]]
-    send_message(
-        chat_id,
-        f"{DICEROLL_MODE_EMOJI['crazy' if crazy else '1v1']} <b>Diceroll {pretty}</b> — {mention(user_id, username)}\n\n"
-        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
-        f"Who's your opponent?",
-        reply_markup={"inline_keyboard": buttons}
-    )
+    _diceroll_prompt_duel_opponent(chat_id, user_id, username, amount, crazy)
 
 
 def diceroll_first_to_keyboard(cflag, amount, opponent_type, owner_id):
     return {"inline_keyboard": [[
-        {"text": f"First to {n}", "callback_data": f"dr_duelfirst:{cflag}:{amount}:{opponent_type}:{n}:{owner_id}"}
+        {"text": f"First to {n}", "callback_data": f"dr_duelfirst:{cflag}:{amount}:{opponent_type}:{n}:{owner_id}", "style": "primary"}
         for n in (1, 2, 3)
     ]]}
 
@@ -7681,7 +7853,7 @@ def _diceroll_confirm_duel(chat_id, message_id, clicking_user_id, callback_id, c
             f"{DICEROLL_MODE_EMOJI['crazy' if crazy else '1v1']} <b>Diceroll {pretty}</b> — {mention(owner_id, username)} is challenging the group!\n\n"
             f"Bet: <b>{fmt_money(owner_id, amount)}</b> each · First to <b>{first_to}</b>\n\n"
             f"Tap below to accept (needs the same balance):",
-            reply_markup={"inline_keyboard": [[{"text": "Join Challenge", "callback_data": "dr_join", "icon_custom_emoji_id": "5424998570539373838"}]]}
+            reply_markup={"inline_keyboard": [[{"text": "Join Challenge", "callback_data": "dr_join", "icon_custom_emoji_id": "5424998570539373838", "style": "primary"}]]}
         )
 
 
