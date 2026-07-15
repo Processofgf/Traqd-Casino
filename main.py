@@ -1313,6 +1313,160 @@ def get_user_stats(user_id, username=None):
     return dict(_get_or_load_stats(user_id, username))
 
 
+# ---------------------------------------------------------------------------
+# /refer — referral system. Each user gets a permanent deep link
+# (t.me/<bot>?start=ref_<their_id>). Whoever opens the bot for the very
+# FIRST time ever through that link gets permanently attributed to that
+# referrer (one referrer per user, set once, never changes). From then on,
+# every single deposit that referred user ever makes - not just their
+# first - pays the referrer REFERRAL_COMMISSION_RATE straight into their
+# withdrawable real balance, for life.
+# ---------------------------------------------------------------------------
+REFERRAL_COMMISSION_RATE = 0.044  # 4.4%, lifetime, on every deposit
+
+referrals = {}        # referred_user_id -> referrer_user_id (permanent once set)
+referral_stats = {}   # referrer_user_id -> {"referred_count", "referred_ids", "lifetime_commission"}
+REFERRAL_LOCK = threading.Lock()
+
+
+def _new_referral_stats():
+    return {"referred_count": 0, "referred_ids": [], "lifetime_commission": 0.0}
+
+
+def _persist_referral_link(referred_id, referrer_id):
+    if DB_ENABLED:
+        try:
+            db.save_setting(f"referredby:{referred_id}", str(referrer_id))
+        except Exception as e:
+            print(f"⚠️ Could not persist referral link for {referred_id}: {e}")
+
+
+def _persist_referral_stats(referrer_id, snapshot):
+    if DB_ENABLED:
+        try:
+            db.save_setting(f"refstats:{referrer_id}", json.dumps(snapshot))
+        except Exception as e:
+            print(f"⚠️ Could not persist referral stats for {referrer_id}: {e}")
+
+
+def get_referrer(user_id):
+    """Returns the user_id who referred `user_id`, or None. Lazily loads
+    from DB on first lookup in this process, then caches in memory."""
+    with REFERRAL_LOCK:
+        if user_id in referrals:
+            return referrals[user_id]
+    loaded = None
+    if DB_ENABLED:
+        try:
+            raw = db.load_setting(f"referredby:{user_id}")
+            if raw:
+                loaded = int(raw)
+        except Exception as e:
+            print(f"⚠️ Could not load referral link for {user_id}: {e}")
+    with REFERRAL_LOCK:
+        referrals.setdefault(user_id, loaded)
+        return referrals[user_id]
+
+
+def set_referrer(referred_id, referrer_id):
+    """Permanently links referred_id -> referrer_id. Only ever called from
+    the ref_ deep-link branch of /start, and only for a user who is being
+    seen for the very first time ever - so there's no legitimate way to
+    switch referrers later or refer an existing player retroactively.
+    Returns False (no-op) if this user already has a referrer, is trying
+    to refer themselves, or the referrer id doesn't parse."""
+    if referred_id == referrer_id:
+        return False
+    with REFERRAL_LOCK:
+        if referrals.get(referred_id) is not None:
+            return False
+        referrals[referred_id] = referrer_id
+        s = referral_stats.get(referrer_id)
+        if s is None:
+            s = _new_referral_stats()
+            referral_stats[referrer_id] = s
+        if referred_id not in s["referred_ids"]:
+            s["referred_ids"].append(referred_id)
+            s["referred_count"] += 1
+        stats_snapshot = dict(s)
+    _persist_referral_link(referred_id, referrer_id)
+    _persist_referral_stats(referrer_id, stats_snapshot)
+    return True
+
+
+def get_referral_stats(user_id):
+    """Lazily loads a user's referral stats (as a referrer) from DB if not
+    already cached, and returns a fresh dict."""
+    with REFERRAL_LOCK:
+        s = referral_stats.get(user_id)
+        if s is not None:
+            return dict(s)
+    loaded = None
+    if DB_ENABLED:
+        try:
+            raw = db.load_setting(f"refstats:{user_id}")
+            if raw:
+                loaded = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as e:
+            print(f"⚠️ Could not load referral stats for {user_id}: {e}")
+    with REFERRAL_LOCK:
+        s = referral_stats.get(user_id)
+        if s is None:
+            s = loaded if isinstance(loaded, dict) else _new_referral_stats()
+            referral_stats[user_id] = s
+        return dict(s)
+
+
+def record_referral_commission(referrer_id, referred_id, referred_username, deposit_amount):
+    """Credits the referrer REFERRAL_COMMISSION_RATE of a referred user's
+    deposit, straight into the referrer's withdrawable real balance (no
+    wager lock - this is a marketing payout, not the referrer's own
+    deposit). Fires on every deposit the referred user ever makes, for
+    life, not just their first."""
+    commission = round(deposit_amount * REFERRAL_COMMISSION_RATE, 2)
+    if commission <= 0:
+        return
+    with REFERRAL_LOCK:
+        s = referral_stats.get(referrer_id)
+        if s is None:
+            s = _new_referral_stats()
+            referral_stats[referrer_id] = s
+        s["lifetime_commission"] = round(s["lifetime_commission"] + commission, 2)
+        snapshot = dict(s)
+    _persist_referral_stats(referrer_id, snapshot)
+    adjust_balance(referrer_id, commission)
+    try:
+        send_message(
+            referrer_id,
+            f"{cemoji('money')} <b>Referral commission!</b>\n\n"
+            f"{mention(referred_id, referred_username)} just deposited — you earned "
+            f"<b>{fmt_money(referrer_id, commission)}</b> ({REFERRAL_COMMISSION_RATE * 100:g}% lifetime commission).\n"
+            f"{cemoji('trophy')} Total earned from referrals: <b>{fmt_money(referrer_id, snapshot['lifetime_commission'])}</b>"
+        )
+    except Exception as e:
+        print(f"⚠️ Could not notify referrer {referrer_id} of commission: {e}")
+
+
+def handle_refer_command(chat_id, user_id, username):
+    if not BOT_USERNAME:
+        fetch_bot_username()
+    if not BOT_USERNAME:
+        send_message(chat_id, f"{WARN_EMOJI} Referral links aren't available right now - try again shortly.")
+        return
+    link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    stats = get_referral_stats(user_id)
+    send_message(
+        chat_id,
+        f"{cemoji('money')} <b>Refer & Earn</b>\n\n"
+        f"Share your link — everyone who joins Traqd Casino through it gets "
+        f"permanently linked to you, and you earn <b>{REFERRAL_COMMISSION_RATE * 100:g}% of every deposit "
+        f"they ever make</b>, for life. Not just their first deposit — <b>all of them</b>.\n\n"
+        f"🔗 <code>{link}</code>\n\n"
+        f"👥 Referred: <b>{stats['referred_count']}</b>\n"
+        f"{cemoji('trophy')} Lifetime commission earned: <b>{fmt_money(user_id, stats['lifetime_commission'])}</b>"
+    )
+
+
 def get_user_profile_photo_bytes(user_id):
     """Fetches the user's current Telegram profile photo (biggest available
     size) as raw bytes, or None if they have no photo / it can't be
@@ -2760,6 +2914,12 @@ def handle_deposit_ipn(payload):
 
     adjust_balance(user_id, usd_amount)
     record_deposit(user_id, usd_amount)
+    referrer_id = get_referrer(user_id)
+    if referrer_id:
+        try:
+            record_referral_commission(referrer_id, user_id, username, usd_amount)
+        except Exception as e:
+            print(f"⚠️ Referral commission failed (referrer {referrer_id}, deposit by {user_id}): {e}")
     deposit_wager_total = _apply_deposit_wager_requirement(user_id, usd_amount)
     # Welcome/first-deposit bonus removed - _apply_first_deposit_bonus() and
     # the bonus_balance wagering machinery are left in place (dormant, since
@@ -5726,6 +5886,25 @@ def handle_message(message):
             except Exception as e:
                 print(f"⚠️ Could not record user {user_id}: {e}")
 
+        # Referral attribution - only possible right here, on this user's
+        # provably first-ever message to the bot, so there's no way to
+        # retroactively "claim" an existing player as a referral.
+        start_parts = text.split(maxsplit=1)
+        if len(start_parts) == 2 and start_parts[0] == "/start" and start_parts[1].startswith("ref_"):
+            ref_id_str = start_parts[1][len("ref_"):]
+            if ref_id_str.isdigit():
+                referrer_id = int(ref_id_str)
+                if set_referrer(user_id, referrer_id):
+                    try:
+                        send_message(
+                            referrer_id,
+                            f"{cemoji('trophy')} <b>New referral!</b> "
+                            f"{mention(user_id, message['from'].get('first_name', 'Player'))} just joined through your link. "
+                            f"You'll earn {REFERRAL_COMMISSION_RATE * 100:g}% of everything they ever deposit."
+                        )
+                    except Exception as e:
+                        print(f"⚠️ Could not notify referrer {referrer_id} of new signup: {e}")
+
     if not text.startswith("/"):
         # Not a command - might be a reply to a /deposit or /withdraw prompt
         # (a bare amount, or a wallet address). Let that flow claim it;
@@ -5993,6 +6172,7 @@ def handle_message(message):
             f'<b><tg-emoji emoji-id="5215420556089776398">💰</tg-emoji> Wallet</b>\n'
             f"/balance — check your balance\n"
             f"/stats — your lifetime stats as an image card\n"
+            f"/refer — get your referral link, earn {REFERRAL_COMMISSION_RATE * 100:g}% of everything your referrals ever deposit\n"
             f"/deposit — deposit crypto (min ${MIN_DEPOSIT:.2f})\n"
             f"/withdraw — withdraw crypto (min ${MIN_WITHDRAW:.2f})\n\n"
             f"Your <b>first deposit</b> gets a <b>130% bonus</b> automatically. "
@@ -6050,6 +6230,11 @@ def handle_message(message):
         name = message["from"].get("first_name", "Player")
         handle = message["from"].get("username")
         handle_stats_command(chat_id, user_id, name, handle)
+        return
+
+    if command == "/refer":
+        name = message["from"].get("first_name", "Player")
+        handle_refer_command(chat_id, user_id, name)
         return
 
     if command == "/currency":
@@ -8584,6 +8769,7 @@ def main():
             {"command": "withdraw", "description": "Withdraw your balance"},
             {"command": "balance", "description": "Check your balance"},
             {"command": "stats", "description": "Your lifetime casino stats"},
+            {"command": "refer", "description": "Get your referral link, earn 4.4% lifetime"},
             {"command": "currency", "description": "Set display currency (USD/INR/LTC)"},
             {"command": "blackjack", "description": "Play Blackjack"},
             {"command": "luckyroll", "description": "Play Lucky Roll (dice)"},
