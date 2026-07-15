@@ -190,7 +190,7 @@ STARTING_BALANCE = 0.00
 MIN_BET = 0.53      # ≈ ₹50 at ₹95/$1
 MAX_BET = 100.00
 
-MIN_DEPOSIT = 3.00
+MIN_DEPOSIT = 5.00
 MIN_WITHDRAW = 10.00
 MIN_TIP = 0.50
 FIRST_DEPOSIT_BONUS_PCT = 1.30     # 130% match on the very first deposit
@@ -2761,7 +2761,12 @@ def handle_deposit_ipn(payload):
     adjust_balance(user_id, usd_amount)
     record_deposit(user_id, usd_amount)
     deposit_wager_total = _apply_deposit_wager_requirement(user_id, usd_amount)
-    bonus_amount = _apply_first_deposit_bonus(user_id, usd_amount)
+    # Welcome/first-deposit bonus removed - _apply_first_deposit_bonus() and
+    # the bonus_balance wagering machinery are left in place (dormant, since
+    # nothing calls this anymore) rather than ripped out, since bonus_balance
+    # is threaded through get_balance/spend_for_bet/credit_winnings etc. and
+    # touching those for an already-disabled feature isn't worth the risk.
+    bonus_amount = 0.0
 
     new_balance = get_balance(user_id)
     msg = (
@@ -7123,33 +7128,45 @@ diceroll_open_challenges = {}    # chat_id -> game_id (one open 1v1/Crazy challe
 
 
 def send_helper_dice(chat_id):
-    """Throws a real animated Telegram dice and returns the value Telegram
-    rolled (1-6) - this is the bot's "throw" in vs-Bot matches.
+    """Rolls the bot's "throw" in vs-Bot matches. The number is generated
+    fairly server-side FIRST (secrets.randbelow - the same standard used
+    for every other RNG in this file), not from Telegram's own sendDice
+    animation. That's deliberate: Telegram's sendDice endpoint picks its
+    own value that nobody (not even the sending bot) can see or set in
+    advance, so there's no way to land on an already-decided number using
+    it - the fairness has to happen here instead, then a helper bot
+    account just posts whatever that number was. Purely cosmetic from
+    that point on: the actual randomness already happened above.
 
-    A helper bot is a *separate* Telegram bot account, and its messages
-    can only ever land in a chat it's actually a member of - i.e. a group.
-    A private chat is strictly a 1-on-1 thread between the player and
+    A helper bot is a *separate* Telegram bot account, and it can only
+    ever post into a chat it's actually a member of - i.e. a group. A
+    private chat is strictly a 1-on-1 thread between the player and
     whichever bot they're talking to; a helper bot was never added to it
     (Telegram won't even let a bot message a user who hasn't /start'ed
-    that specific bot), so picking a helper token for a DM used to fail
-    silently and fall back to an invisible server-rolled number - no dice
-    animation at all. Group chat_ids are always negative in Telegram's
-    API, private chat_ids are always positive, so that's enough to tell
-    them apart without threading chat_type through every call site."""
+    that specific bot), so in DMs the main bot posts the roll itself
+    instead. Group chat_ids are always negative in Telegram's API,
+    private chat_ids are always positive, so that's enough to tell them
+    apart without threading chat_type through every call site."""
+    roll = secrets.randbelow(6) + 1
     use_helper = bool(HELPER_BOT_TOKENS) and chat_id < 0
     token = random.choice(HELPER_BOT_TOKENS) if use_helper else BOT_TOKEN
     try:
-        resp = SESSION.post(f"https://api.telegram.org/bot{token}/sendDice",
-                             json={"chat_id": chat_id, "emoji": "🎲"}, timeout=15)
+        resp = SESSION.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": f"🎲 Rolled: {DICEROLL_FACES[roll]} <b>{roll}</b>", "parse_mode": "HTML"},
+            timeout=15
+        )
         data = resp.json()
-        if data.get("ok"):
-            return data["result"]["dice"]["value"]
-        print(f"⚠️ Helper dice send failed: {data}")
+        if not data.get("ok"):
+            print(f"⚠️ Helper dice send failed: {data}")
     except Exception as e:
         print(f"⚠️ Helper dice send error: {e}")
-    # Last-resort fallback if the API call itself failed (e.g. bad token) -
-    # a fair server-side roll so the match can still continue.
-    return secrets.randbelow(6) + 1
+    # Even if the post itself fails (bad token, helper not in the group,
+    # network hiccup), `roll` was already fairly decided above, so the
+    # match keeps going correctly either way - only the cosmetic "look, a
+    # dice landed" message is what might be missing.
+    return roll
+
 
 
 def diceroll_cleanup(game_id):
