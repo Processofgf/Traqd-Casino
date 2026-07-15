@@ -1054,6 +1054,45 @@ def _persist_stats(user_id, snapshot):
             print(f"⚠️ Could not persist stats for user {user_id}: {e}")
 
 
+def _get_or_load_stats(user_id, username=None):
+    """Returns the LIVE in-memory stats dict for a user (not a copy) -
+    loading it from DB first if this process hasn't cached them yet.
+
+    This is the fix for the "stats don't update properly" bug: every
+    caller below used to check the raw in-memory user_stats dict and
+    silently create a BLANK entry whenever it was missing - which is
+    guaranteed right after every restart/redeploy, since the in-memory
+    cache starts empty. The very next bet/deposit/withdrawal from a
+    returning user would then persist that blank entry back to DB,
+    permanently wiping their real lifetime history. Routing every
+    creation path through here (which checks DB before ever creating a
+    genuinely-new entry) fixes it for all of them at once."""
+    with STATS_LOCK:
+        s = user_stats.get(user_id)
+        if s is not None:
+            if username:
+                s["username"] = username
+            return s
+    loaded = None
+    if DB_ENABLED:
+        try:
+            raw = db.load_setting(f"stats:{user_id}")
+            if raw:
+                loaded = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as e:
+            print(f"⚠️ Could not load stats for user {user_id}: {e}")
+    with STATS_LOCK:
+        s = user_stats.get(user_id)
+        if s is None:
+            s = _new_stats_entry(username)
+            if isinstance(loaded, dict):
+                s.update(loaded)
+            user_stats[user_id] = s
+        if username:
+            s["username"] = username
+        return s
+
+
 # ---------------------------------------------------------------------------
 # Rolling 30-day bet log - powers the /stats card's profit-trend chart,
 # win/loss split, and per-game breakdown table. Separate from user_stats
@@ -1077,6 +1116,14 @@ def _persist_bet_log(user_id, log):
 def _append_bet_log(user_id, game, wagered, profit):
     now = time.time()
     cutoff = now - BET_LOG_MAX_AGE_DAYS * 86400
+    # Same bug as user_stats: without this, the first bet after a restart
+    # would setdefault() straight to an empty list (since nothing's cached
+    # yet in this process) and persist THAT back to DB, wiping the user's
+    # real 30-day history instead of appending to it. get_user_bet_log()
+    # loads from DB and populates the in-memory cache as a side effect, so
+    # the setdefault below is guaranteed to find their real history already
+    # sitting there instead of creating a blank one.
+    get_user_bet_log(user_id)
     with BET_LOG_LOCK:
         log = user_bet_log.setdefault(user_id, [])
         log.append({"t": now, "g": game, "w": wagered, "pf": profit})
@@ -1194,11 +1241,9 @@ def record_bet_result(user_id, username, game, wagered, payout):
     0 for a straight loss, the full return (stake back + winnings) for a
     win, and the stake itself for a push."""
     profit = round(payout - wagered, 2)
+    _get_or_load_stats(user_id, username)  # loads real DB history first - see docstring on _get_or_load_stats
     with STATS_LOCK:
-        s = user_stats.get(user_id)
-        if s is None:
-            s = _new_stats_entry(username)
-            user_stats[user_id] = s
+        s = user_stats[user_id]
         if username:
             s["username"] = username
         s["games_played"] += 1
@@ -1231,11 +1276,9 @@ def record_bet_result(user_id, username, game, wagered, payout):
 def record_deposit(user_id, amount):
     """Adds a completed deposit's USD amount into lifetime stats (for the
     Deposits card on /stats). Separate from wallet balance tracking."""
+    _get_or_load_stats(user_id)
     with STATS_LOCK:
-        s = user_stats.get(user_id)
-        if s is None:
-            s = _new_stats_entry(None)
-            user_stats[user_id] = s
+        s = user_stats[user_id]
         s["deposits_total"] = round(s["deposits_total"] + amount, 2)
         snapshot = dict(s)
     _persist_stats(user_id, snapshot)
@@ -1244,11 +1287,9 @@ def record_deposit(user_id, amount):
 def record_withdrawal(user_id, amount):
     """Adds a submitted withdrawal's USD amount into lifetime stats (for
     the Withdrawals card on /stats)."""
+    _get_or_load_stats(user_id)
     with STATS_LOCK:
-        s = user_stats.get(user_id)
-        if s is None:
-            s = _new_stats_entry(None)
-            user_stats[user_id] = s
+        s = user_stats[user_id]
         s["withdrawals_total"] = round(s["withdrawals_total"] + amount, 2)
         snapshot = dict(s)
     _persist_stats(user_id, snapshot)
@@ -1257,47 +1298,19 @@ def record_withdrawal(user_id, amount):
 def mark_user_joined(user_id, username=None):
     """Called the first time a user is ever seen, so /stats has a real
     join date to show. A no-op if we already have a stats entry for them
-    (never overwrites an existing joined_at)."""
+    (in memory OR in DB - never overwrites an existing joined_at)."""
     with STATS_LOCK:
-        s = user_stats.get(user_id)
-        if s is not None:
+        if user_id in user_stats:
             return
-        s = _new_stats_entry(username)
-        user_stats[user_id] = s
-        snapshot = dict(s)
-    _persist_stats(user_id, snapshot)
+    s = _get_or_load_stats(user_id, username)
+    _persist_stats(user_id, dict(s))
 
 
 def get_user_stats(user_id, username=None):
     """Lazily loads a user's stats (from DB if not already cached), and
     returns a fresh dict - never a live reference - so callers can't
     accidentally mutate shared state."""
-    with STATS_LOCK:
-        s = user_stats.get(user_id)
-        if s is not None:
-            if username:
-                s["username"] = username
-            return dict(s)
-    loaded = None
-    if DB_ENABLED:
-        try:
-            raw = db.load_setting(f"stats:{user_id}")
-            if raw:
-                loaded = json.loads(raw) if isinstance(raw, str) else raw
-        except Exception as e:
-            print(f"⚠️ Could not load stats for user {user_id}: {e}")
-    with STATS_LOCK:
-        s = user_stats.get(user_id)
-        if s is None:
-            if isinstance(loaded, dict):
-                s = _new_stats_entry(username)
-                s.update(loaded)
-            else:
-                s = _new_stats_entry(username)
-            user_stats[user_id] = s
-        if username:
-            s["username"] = username
-        return dict(s)
+    return dict(_get_or_load_stats(user_id, username))
 
 
 def get_user_profile_photo_bytes(user_id):
@@ -2305,6 +2318,15 @@ def handle_withdraw_command(chat_id, user_id, username, args, chat_type="private
 
     withdrawable = get_withdrawable_balance(user_id)
     w = get_wallet_breakdown(user_id)
+
+    stats = get_user_stats(user_id)
+    if stats.get("deposits_total", 0.0) <= 0:
+        send_message(
+            chat_id,
+            f"{WARN_EMOJI} You need to make at least one deposit before you can withdraw.\n\n"
+            f"Run /deposit to fund your account first."
+        )
+        return
 
     if withdrawable < MIN_WITHDRAW:
         extra = ""
