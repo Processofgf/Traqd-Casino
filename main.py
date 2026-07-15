@@ -197,6 +197,13 @@ FIRST_DEPOSIT_BONUS_PCT = 1.30     # 130% match on the very first deposit
 BONUS_WAGER_MULTIPLIER = 50        # bonus funds need 50x wagered before withdrawal
 DEPOSIT_WAGER_MULTIPLIER = 1       # every deposit needs 1x wagered before ANY withdrawal
 
+# Telegram Stars deposits - paid natively through Telegram's own invoice UI
+# (currency "XTR"), no external payment gateway involved at all. Rate and
+# minimum are business decisions, not derived from anything live.
+STAR_TO_INR_RATE = 1.1     # ₹ per Telegram Star
+MIN_STARS_DEPOSIT = 350    # minimum Stars per deposit
+MAX_STARS_DEPOSIT = 150000
+
 balances = {}
 pending_bets = {}
 active_mines_games = {}
@@ -922,6 +929,32 @@ def api_call(method, **params):
         wait = data.get("parameters", {}).get("retry_after", 1) + 0.2
         time.sleep(wait)
     return data
+
+
+def send_invoice(chat_id, title, description, payload, currency, prices):
+    """Sends a native Telegram invoice. For Telegram Stars, currency must
+    be 'XTR' and provider_token must be the empty string (Stars are settled
+    entirely inside Telegram, no external payment provider involved)."""
+    return api_call(
+        "sendInvoice",
+        chat_id=chat_id,
+        title=title,
+        description=description,
+        payload=payload,
+        provider_token="",
+        currency=currency,
+        prices=json.dumps(prices),
+    )
+
+
+def handle_pre_checkout_query(pre_checkout_query):
+    """Telegram requires an answer within 10 seconds of a pre_checkout_query
+    or the payment is cancelled client-side. These are all self-issued
+    invoices from _process_stars_deposit_amount, so there's nothing to
+    actually validate against (no stock, no external state that could have
+    gone stale) - just approve immediately."""
+    query_id = pre_checkout_query["id"]
+    api_call("answerPreCheckoutQuery", pre_checkout_query_id=query_id, ok=True)
 
 
 def mention(user_id, name):
@@ -2352,6 +2385,7 @@ def deposit_coin_keyboard():
             row = []
     if row:
         rows.append(row)
+    rows.append([{"text": "⭐ Telegram Stars", "callback_data": "dep_stars", "style": "primary"}])
     return {"inline_keyboard": rows}
 
 
@@ -2579,6 +2613,9 @@ def process_deposit_amount(chat_id, user_id, username, text):
     if not flow:
         return False
 
+    if flow.get("coin") == "STARS":
+        return _process_stars_deposit_amount(chat_id, user_id, username, text)
+
     if not APP_URL:
         # Without a reachable APP_URL, NowPayments has nowhere to send the
         # IPN webhook that actually credits the balance - the crypto would
@@ -2649,6 +2686,90 @@ def process_deposit_amount(chat_id, user_id, username, text):
         f"usually within a few minutes. No need to do anything else here."
     )
     return True
+
+
+def _process_stars_deposit_amount(chat_id, user_id, username, text):
+    """Handles the reply to 'how many Stars?' - creates and sends a native
+    Telegram invoice (currency XTR). Nothing is credited yet: that only
+    happens once handle_successful_star_payment() sees the completed
+    payment come back, same as crypto only gets credited once the IPN
+    webhook confirms it."""
+    try:
+        stars = int(text.strip())
+    except ValueError:
+        send_message(chat_id, f"{WARN_EMOJI} Please reply with a whole number of Stars, e.g. <code>{MIN_STARS_DEPOSIT}</code>")
+        return True
+
+    if stars < MIN_STARS_DEPOSIT:
+        send_message(chat_id, f"{WARN_EMOJI} Minimum Stars deposit is <b>{MIN_STARS_DEPOSIT} ⭐</b>")
+        return True
+    if stars > MAX_STARS_DEPOSIT:
+        send_message(chat_id, f"{WARN_EMOJI} Maximum is {MAX_STARS_DEPOSIT:,} ⭐ per deposit. Contact support for larger amounts.")
+        return True
+
+    inr_amount = stars * STAR_TO_INR_RATE
+    usd_amount = round(inr_amount / FIXED_USD_INR_RATE, 2)
+    invoice_payload = f"stars_deposit:{user_id}:{stars}:{secrets.token_urlsafe(8)}"
+
+    result = send_invoice(
+        chat_id=chat_id,
+        title="Traqd Casino - Star Deposit",
+        description=f"Deposit {stars} Telegram Stars (₹{inr_amount:.0f} ≈ ${usd_amount:.2f} balance)",
+        payload=invoice_payload,
+        currency="XTR",
+        prices=[{"label": f"{stars} Stars", "amount": stars}],
+    )
+    _clear_deposit_flow(user_id)
+
+    if not result or not result.get("ok"):
+        send_message(chat_id, f"{WARN_EMOJI} Couldn't create the Stars invoice right now. Please try again shortly.")
+        print(f"sendInvoice (Stars) failed for user {user_id}: {result}")
+        return True
+
+    return True
+
+
+# Guards against crediting the same Stars payment twice - Telegram's own
+# successful_payment update is a one-shot event per purchase, but this is
+# cheap insurance against any duplicate delivery.
+processed_star_charge_ids = set()
+STAR_CHARGE_LOCK = threading.Lock()
+
+
+def handle_successful_star_payment(message):
+    """Called from handle_message() the moment a successful_payment field
+    shows up on an incoming message - that's Telegram's own confirmation
+    that a Stars purchase completed. Credits the balance through the exact
+    same shared path crypto deposits use (referral commission, deposit
+    wager requirement, everything)."""
+    sp = message["successful_payment"]
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    username = message["from"].get("first_name", "Player")
+    charge_id = sp.get("telegram_payment_charge_id", "")
+
+    with STAR_CHARGE_LOCK:
+        if charge_id and charge_id in processed_star_charge_ids:
+            return  # already credited - duplicate delivery, ignore
+        if charge_id:
+            processed_star_charge_ids.add(charge_id)
+
+    payload = sp.get("invoice_payload", "")
+    parts = payload.split(":")
+    stars = sp.get("total_amount", 0)  # authoritative - what was actually charged
+    if len(parts) >= 3 and parts[0] == "stars_deposit":
+        try:
+            stars = int(parts[2])
+        except ValueError:
+            pass
+
+    inr_amount = stars * STAR_TO_INR_RATE
+    usd_amount = round(inr_amount / FIXED_USD_INR_RATE, 2)
+
+    _credit_confirmed_deposit(
+        user_id, chat_id, username, usd_amount,
+        extra_note=f" ({stars} ⭐ Telegram Stars)"
+    )
 
 
 def process_withdraw_amount(chat_id, user_id, username, text):
@@ -2855,6 +2976,21 @@ def handle_deposit_callback(callback_id, chat_id, user_id, username, coin):
     start_deposit_amount_prompt(chat_id, user_id, username, coin)
 
 
+def handle_deposit_stars_callback(callback_id, chat_id, user_id, username):
+    answer_callback(callback_id)
+    _set_deposit_flow(user_id, {"coin": "STARS"})
+    min_inr = MIN_STARS_DEPOSIT * STAR_TO_INR_RATE
+    min_usd = round(min_inr / FIXED_USD_INR_RATE, 2)
+    send_message(
+        chat_id,
+        f"⭐ <b>Telegram Stars Deposit</b>\n\n"
+        f"Rate: <b>1 ⭐ = ₹{STAR_TO_INR_RATE:g}</b>\n"
+        f"Minimum: <b>{MIN_STARS_DEPOSIT} ⭐</b> (₹{min_inr:.0f} ≈ ${min_usd:.2f})\n\n"
+        f"Reply with how many Stars you want to deposit.\n"
+        f"Example: <code>{MIN_STARS_DEPOSIT}</code>"
+    )
+
+
 def handle_withdraw_coin_callback(callback_id, chat_id, user_id, username, coin):
     if coin not in DEPOSIT_COINS:
         answer_callback(callback_id, "Unknown coin.")
@@ -2912,6 +3048,15 @@ def handle_deposit_ipn(payload):
             "payment_id": payment_id, "at": time.time(),
         })
 
+    _credit_confirmed_deposit(user_id, chat_id, username, usd_amount)
+
+
+def _credit_confirmed_deposit(user_id, chat_id, username, usd_amount, extra_note=""):
+    """Shared crediting path for ANY confirmed deposit, regardless of how
+    it was paid for (crypto via NOWPayments IPN, or Telegram Stars via the
+    native successful_payment flow) - balance credit, lifetime stats,
+    referral commission, and the 1x deposit-wager requirement all happen
+    exactly once, the same way, no matter the payment method."""
     adjust_balance(user_id, usd_amount)
     record_deposit(user_id, usd_amount)
     referrer_id = get_referrer(user_id)
@@ -2931,7 +3076,7 @@ def handle_deposit_ipn(payload):
     new_balance = get_balance(user_id)
     msg = (
         f"{cemoji('money')} <b>Deposit confirmed!</b>\n\n"
-        f"Amount: <b>${usd_amount:.2f}</b>\n"
+        f"Amount: <b>${usd_amount:.2f}</b>{extra_note}\n"
     )
     if bonus_amount > 0:
         w = get_wallet_breakdown(user_id)
@@ -2945,6 +3090,8 @@ def handle_deposit_ipn(payload):
     )
     msg += f"\nNew balance: <b>${new_balance:.2f}</b>"
     send_message(chat_id, msg)
+
+
 
 
 def handle_payout_ipn(payload):
@@ -4317,6 +4464,10 @@ def handle_callback(callback_query):
     if action == "dep_coin":
         coin = parts[1]
         handle_deposit_callback(callback_id, chat_id, clicking_user_id, username, coin)
+        return
+
+    if action == "dep_stars":
+        handle_deposit_stars_callback(callback_id, chat_id, clicking_user_id, username)
         return
 
     if action == "wd_coin":
@@ -5854,6 +6005,12 @@ def handle_message(message):
     chat_id = message["chat"]["id"]
     user_id = message["from"]["id"]
     text = message.get("text", "").strip()
+
+    # A completed Telegram Stars deposit - carries no "text" either, must
+    # be checked up front same as the dice check right below.
+    if message.get("successful_payment"):
+        handle_successful_star_payment(message)
+        return
 
     # A physical 🎲 the player threw themselves for an active Diceroll round
     # (Odd/Even, High/Low, Prediction, 1v1, Crazy Mode) - these carry no
@@ -8898,6 +9055,8 @@ def main():
                             handle_message(update["message"])
                         elif "callback_query" in update:
                             handle_callback(update["callback_query"])
+                        elif "pre_checkout_query" in update:
+                            handle_pre_checkout_query(update["pre_checkout_query"])
                     except Exception as e:
                         print(f"Error handling update: {e}")
 
@@ -8911,6 +9070,8 @@ def main():
                     dispatch_user_id = update["callback_query"]["from"]["id"]
                 elif "message" in update:
                     dispatch_user_id = update["message"]["from"]["id"]
+                elif "pre_checkout_query" in update:
+                    dispatch_user_id = update["pre_checkout_query"]["from"]["id"]
                 else:
                     dispatch_user_id = None
 
