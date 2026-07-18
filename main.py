@@ -3595,6 +3595,71 @@ def handle_callback(callback_query):
         dicebattle_confirm_rounds(chat_id, message_id, clicking_user_id, callback_id, rounds, float(amount_s), int(owner_id_s), username)
         return
 
+    if action == "bowl_mode":
+        mode, amount_s, owner_id_s = parts[1], parts[2], parts[3]
+        owner_id = int(owner_id_s)
+        amount = float(amount_s)
+        if clicking_user_id != owner_id:
+            answer_callback(callback_id, "🚫 This isn't your bet! Start your own with /bowling <amount>")
+            return
+        if owner_id in user_active_bowling:
+            answer_callback(callback_id, f"{WARN_EMOJI} You already have an active Bowling game!", show_alert=True)
+            return
+        answer_callback(callback_id)
+        pretty = BOWLING_MODE_LABEL[mode]
+        edit_message(
+            chat_id, message_id,
+            f"{BOWLING_EMOJI} <b>Bowling — {pretty}</b> — {mention(owner_id, username)}\n\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n\n"
+            f"Pick how many frames each side throws:",
+            reply_markup=bowling_rounds_keyboard(mode, amount, owner_id)
+        )
+        return
+
+    if action == "bowl_rounds":
+        mode, rounds_s, amount_s, owner_id_s = parts[1], parts[2], parts[3], parts[4]
+        rounds = int(rounds_s)
+        amount = float(amount_s)
+        owner_id = int(owner_id_s)
+        if clicking_user_id != owner_id:
+            answer_callback(callback_id, "🚫 This isn't your bet! Start your own with /bowling <amount>")
+            return
+        answer_callback(callback_id)
+        pretty = BOWLING_MODE_LABEL[mode]
+        win_rule = "Lowest total wins" if mode == "crazy" else "Highest total wins"
+        edit_message(
+            chat_id, message_id,
+            f"{BOWLING_EMOJI} <b>Bowling — {pretty}</b> — {mention(owner_id, username)}\n\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b>\n"
+            f"Frames: <b>{rounds}</b> · {win_rule}\n\n"
+            f"Confirm your bet?",
+            reply_markup={"inline_keyboard": [[
+                {"text": "✅ Confirm", "callback_data": f"bowl_confirm:{mode}:{rounds}:{amount}:{owner_id}", "style": "primary"},
+                {"text": "❌ Cancel", "callback_data": f"bowl_cancel:{owner_id}", "style": "primary"},
+            ]]}
+        )
+        return
+
+    if action == "bowl_cancel":
+        owner_id = int(parts[1])
+        if clicking_user_id != owner_id:
+            answer_callback(callback_id, "🚫 This isn't your bet!")
+            return
+        answer_callback(callback_id, "Cancelled.")
+        edit_message(chat_id, message_id, "❌ Bet cancelled. Run /bowling to start again.")
+        return
+
+    if action == "bowl_confirm":
+        mode, rounds_s, amount_s, owner_id_s = parts[1], parts[2], parts[3], parts[4]
+        callback_chat_type = callback_query["message"]["chat"].get("type", "private")
+        _bowling_confirm_start(chat_id, message_id, clicking_user_id, callback_id, mode, int(rounds_s), float(amount_s), int(owner_id_s), username, callback_chat_type)
+        return
+
+    if action == "bowl_join":
+        answer_callback(callback_id)
+        _bowling_join_open_challenge(chat_id, clicking_user_id, username)
+        return
+
     if action == "dr_ou":
         # Player just picked High/Low or Odd/Even - show a confirmation
         # screen before touching their balance. Nothing is deducted here;
@@ -6017,7 +6082,8 @@ def handle_message(message):
     if message.get("dice"):
         if not try_handle_diceroll_message(chat_id, user_id, message):
             if not try_handle_dicebattle_message(chat_id, user_id, message):
-                try_handle_darts_message(chat_id, user_id, message)
+                if not try_handle_bowling_message(chat_id, user_id, message):
+                    try_handle_darts_message(chat_id, user_id, message)
         return
 
     uname = message["from"].get("username")
@@ -6096,6 +6162,7 @@ def handle_message(message):
         "/wd": "/withdraw",
         "/hb": "/housebalance",
         "/dr": "/diceroll",
+        "/bowl": "/bowling",
     }
     command = COMMAND_ALIASES.get(command, command)
 
@@ -6349,6 +6416,8 @@ def handle_message(message):
             f"/luckyroll &lt;amount&gt; — roll under/over your target\n"
             f"/diceroll — real 🎲 dice games: Odd/Even, High/Low, Prediction, "
             f"1v1, Crazy Mode (send /diceroll alone for the full syntax)\n"
+            f"/bowling &lt;amount&gt; — real 🎳 bowling dice: Classic (vs bot, highest "
+            f"wins), Crazy (vs bot, lowest wins), PvP (1v1 challenge)\n"
             f"/darts &lt;amount&gt; — real 🎯 dart throw: bullseye (6) pays 2x, "
             f"on the board (2-5) pays 0.5x, miss (1) loses\n"
             f"/coinflip &lt;amount&gt; &lt;heads|tails&gt; — 50/50, straight up\n"
@@ -6495,6 +6564,12 @@ def handle_message(message):
         username = message["from"].get("first_name", "Player")
         chat_type = message["chat"].get("type", "private")
         handle_dicebattle_command(chat_id, user_id, username, args, chat_type)
+        return
+
+    if command == "/bowling":
+        username = message["from"].get("first_name", "Player")
+        chat_type = message["chat"].get("type", "private")
+        handle_bowling_command(chat_id, user_id, username, args, chat_type)
         return
 
     if command == "/clearmines":
@@ -7221,6 +7296,21 @@ DICEBATTLE_LOCK = threading.Lock()
 DICEBATTLE_HOUSE_EDGE = 0.01
 DICEBATTLE_PAYOUT = round((1 - DICEBATTLE_HOUSE_EDGE) / 0.5, 2)  # 1.98x, same 50/50 convention as the rest
 
+# /bowl, /bowling - real Telegram bowling dice (🎳, values 1-6, 6 = strike).
+# Three modes: Classic (vs bot, highest total wins), Crazy (vs bot, LOWEST
+# total wins), PvP (1v1 open challenge vs another player, highest wins).
+# Unlike Diceroll's alternating duels, this throws in BATCHES like Dice
+# Battle above - but in the opposite order: the human always throws all
+# their frames first, then the bot (or the joining player) throws theirs.
+BOWLING_EMOJI = "🎳"
+active_bowling_games = {}      # token -> game dict
+user_active_bowling = {}       # user_id -> token (one live Bowling game per user)
+bowling_open_challenges = {}   # chat_id -> token (one open PvP challenge waiting for a joiner, per chat)
+BOWLING_LOCK = threading.Lock()
+BOWLING_HOUSE_EDGE = 0.01
+BOWLING_PAYOUT = round((1 - BOWLING_HOUSE_EDGE) / 0.5, 2)  # 1.98x
+BOWLING_MODE_LABEL = {"classic": "Classic", "crazy": "Crazy", "pvp": "PvP"}
+
 
 def dice_multiplier(win_chance_pct, house_edge=DICE_HOUSE_EDGE):
     """Fair multiplier for a win chance given as a percentage (0-100) - same
@@ -7566,9 +7656,10 @@ user_active_diceroll = {}        # user_id -> game_id (one active Diceroll flow 
 diceroll_open_challenges = {}    # chat_id -> game_id (one open 1v1/Crazy challenge waiting for a joiner, per chat)
 
 
-def send_helper_dice(chat_id):
-    """Throws a real animated Telegram dice and returns the value Telegram
-    rolled (1-6) - this is the bot's "throw" in vs-Bot matches.
+def send_helper_dice(chat_id, emoji="🎲"):
+    """Throws a real animated Telegram dice (or bowling ball, dart, etc. -
+    any of Telegram's native dice-emoji types) and returns the value
+    Telegram rolled - this is the bot's "throw" in vs-Bot matches.
 
     A helper bot is a *separate* Telegram bot account, and its messages
     can only ever land in a chat it's actually a member of - i.e. a group.
@@ -7584,7 +7675,7 @@ def send_helper_dice(chat_id):
     token = random.choice(HELPER_BOT_TOKENS) if use_helper else BOT_TOKEN
     try:
         resp = SESSION.post(f"https://api.telegram.org/bot{token}/sendDice",
-                             json={"chat_id": chat_id, "emoji": "🎲"}, timeout=15)
+                             json={"chat_id": chat_id, "emoji": emoji}, timeout=15)
         data = resp.json()
         if data.get("ok"):
             return data["result"]["dice"]["value"]
@@ -8723,6 +8814,315 @@ def _dicebattle_settle(game):
 
 
 # ---------------------------------------------------------------------------
+# BOWLING - /bowl, /bowling
+# ---------------------------------------------------------------------------
+
+def bowling_mode_keyboard(amount, owner_id):
+    return {"inline_keyboard": [
+        [{"text": "Classic (highest wins)", "callback_data": f"bowl_mode:classic:{amount}:{owner_id}", "style": "primary"}],
+        [{"text": "Crazy (lowest wins)", "callback_data": f"bowl_mode:crazy:{amount}:{owner_id}", "style": "primary"}],
+        [{"text": "PvP (1v1 challenge)", "callback_data": f"bowl_mode:pvp:{amount}:{owner_id}", "style": "primary"}],
+    ]}
+
+
+def bowling_rounds_keyboard(mode, amount, owner_id):
+    return {"inline_keyboard": [[
+        {"text": f"First to {n}", "callback_data": f"bowl_rounds:{mode}:{n}:{amount}:{owner_id}", "style": "primary"}
+        for n in (1, 2, 3)
+    ]]}
+
+
+def handle_bowling_command(chat_id, user_id, username, args, chat_type="private"):
+    if not args:
+        send_message(
+            chat_id,
+            f"{BOWLING_EMOJI} <b>Bowling</b> — real Telegram bowling dice, most pins wins.\n\n"
+            f"Usage: <code>/bowling &lt;amount&gt;</code>\n\n"
+            f"Three modes:\n"
+            f"• <b>Classic</b> — vs a helper bot, highest total wins\n"
+            f"• <b>Crazy</b> — vs a helper bot, lowest total wins\n"
+            f"• <b>PvP</b> — 1v1 open challenge vs another player, highest total wins\n\n"
+            f"You always throw your frames first, then your opponent throws theirs."
+        )
+        return
+
+    amount, _amt_err = resolve_bet_amount(user_id, args[0])
+    if _amt_err == "invalid_number":
+        send_message(chat_id, f"{WARN_EMOJI} Invalid amount. Example: <code>/bowling 10</code>")
+        return
+    if _amt_err == "rate_unavailable":
+        send_message(chat_id, f"{WARN_EMOJI} Currency rate temporarily unavailable - try again shortly, or run /currency to switch to USD.")
+        return
+    if amount < MIN_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Minimum bet is {fmt_money(user_id, MIN_BET)}")
+        return
+    if amount > MAX_BET:
+        send_message(chat_id, f"{WARN_EMOJI} Maximum bet is {fmt_money(user_id, MAX_BET)}")
+        return
+    if user_id in user_active_bowling:
+        send_message(chat_id, f"{WARN_EMOJI} You already have an active Bowling game! Finish it first.")
+        return
+    balance = get_balance(user_id)
+    if amount > balance:
+        send_message(chat_id, f"{WARN_EMOJI} Insufficient balance. Your balance: {fmt_money(user_id, balance)}")
+        return
+
+    send_message(
+        chat_id,
+        f"{BOWLING_EMOJI} <b>Bowling</b> — {mention(user_id, username)}\n\n"
+        f"Bet: <b>{fmt_money(user_id, amount)}</b>\n\n"
+        f"Choose a mode:",
+        reply_markup=bowling_mode_keyboard(amount, user_id)
+    )
+
+
+def _bowling_confirm_start(chat_id, message_id, clicking_user_id, callback_id, mode, rounds, amount, owner_id, username, chat_type="private"):
+    if clicking_user_id != owner_id:
+        answer_callback(callback_id, "This isn't your bet.", show_alert=True)
+        return
+    if mode == "pvp" and chat_type == "private":
+        answer_callback(callback_id, "PvP challenges only work in a group!", show_alert=True)
+        return
+    with BOWLING_LOCK:
+        if owner_id in user_active_bowling:
+            answer_callback(callback_id, "You already have an active Bowling game!", show_alert=True)
+            return
+        if mode == "pvp" and chat_id in bowling_open_challenges:
+            answer_callback(callback_id, "There's already an open Bowling challenge in this group.", show_alert=True)
+            return
+        balance = get_balance(owner_id)
+        if amount > balance:
+            answer_callback(callback_id, "Insufficient balance.", show_alert=True)
+            return
+        adjust_balance(owner_id, -amount)
+        token = secrets.token_urlsafe(10)
+        game = {
+            "token": token, "chat_id": chat_id, "mode": mode, "rounds": rounds, "amount": amount,
+            "p1_id": owner_id, "p1_name": username, "p1_rolls": [],
+            "p2_id": None, "p2_name": None, "p2_rolls": [],
+            "status": "awaiting_join" if mode == "pvp" else "awaiting_p1",
+        }
+        active_bowling_games[token] = game
+        user_active_bowling[owner_id] = token
+        if mode == "pvp":
+            bowling_open_challenges[chat_id] = token
+    answer_callback(callback_id, "Locked in!")
+
+    pretty = BOWLING_MODE_LABEL[mode]
+    if mode == "pvp":
+        edit_message(
+            chat_id, message_id,
+            f"{BOWLING_EMOJI} <b>Bowling PvP</b> — {mention(owner_id, username)} is challenging the group!\n\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> each · <b>{rounds}</b> frame{'s' if rounds > 1 else ''} · Highest total wins\n\n"
+            f"Tap below to accept (needs the same balance):",
+            reply_markup={"inline_keyboard": [[{"text": "Join Challenge", "callback_data": "bowl_join", "style": "primary"}]]}
+        )
+    else:
+        win_rule = "Lowest total wins" if mode == "crazy" else "Highest total wins"
+        edit_message(
+            chat_id, message_id,
+            f"{BOWLING_EMOJI} <b>Bowling — {pretty}</b> — {mention(owner_id, username)}\n\n"
+            f"Bet: <b>{fmt_money(owner_id, amount)}</b> · <b>{rounds}</b> frame{'s' if rounds > 1 else ''} · {win_rule}\n\n"
+            f"Send the {BOWLING_EMOJI} bowling emoji now - you need <b>{rounds}</b> throw{'s' if rounds > 1 else ''}!"
+        )
+
+
+def _bowling_join_open_challenge(chat_id, user_id, username):
+    with BOWLING_LOCK:
+        token = bowling_open_challenges.get(chat_id)
+        if not token:
+            send_message(chat_id, f"{WARN_EMOJI} No open Bowling challenge in this group right now.")
+            return
+        game = active_bowling_games.get(token)
+        if not game or game["status"] != "awaiting_join":
+            send_message(chat_id, f"{WARN_EMOJI} That challenge isn't open anymore.")
+            return
+        if user_id == game["p1_id"]:
+            send_message(chat_id, f"{WARN_EMOJI} You can't join your own challenge!")
+            return
+        if user_id in user_active_bowling:
+            send_message(chat_id, f"{WARN_EMOJI} You already have an active Bowling game! Finish it first.")
+            return
+        amount = game["amount"]
+        balance = get_balance(user_id)
+        if amount > balance:
+            send_message(chat_id, f"{WARN_EMOJI} You need {fmt_money(user_id, amount)} to join. Your balance: {fmt_money(user_id, balance)}")
+            return
+        adjust_balance(user_id, -amount)
+        game["p2_id"] = user_id
+        game["p2_name"] = username
+        game["status"] = "awaiting_p1"
+        user_active_bowling[user_id] = token
+        bowling_open_challenges.pop(chat_id, None)
+        rounds = game["rounds"]
+        p1_id, p1_name = game["p1_id"], game["p1_name"]
+
+    send_message(
+        chat_id,
+        f"{BOWLING_EMOJI} <b>{mention(user_id, username)}</b> joined the Bowling challenge vs "
+        f"{mention(p1_id, p1_name)}!\n\n"
+        f"{mention(p1_id, p1_name)}, send the {BOWLING_EMOJI} bowling emoji now - "
+        f"you need <b>{rounds}</b> throw{'s' if rounds > 1 else ''}!"
+    )
+
+
+def _bowling_run_bot_throws(game):
+    chat_id, token, rounds = game["chat_id"], game["token"], game["rounds"]
+
+    def _run():
+        rolls = []
+        for _ in range(rounds):
+            rolls.append(send_helper_dice(chat_id, emoji=BOWLING_EMOJI))
+            time.sleep(1.5)  # let each bowling animation land before the next throw
+        with BOWLING_LOCK:
+            g = active_bowling_games.get(token)
+            if not g or g["status"] != "bot_throwing":
+                return  # cleared/cancelled while throws were in flight
+            g["p2_rolls"] = rolls
+            g["status"] = "settling"
+        _bowling_settle(g)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def try_handle_bowling_message(chat_id, user_id, message):
+    """Same anti-cheat check as Dice Battle/Diceroll: reject forwarded
+    throws, only ever accept a live roll. Returns True if this dice was
+    consumed by an active Bowling game, False otherwise."""
+    dice = message.get("dice")
+    if not dice or dice.get("emoji") != BOWLING_EMOJI:
+        return False
+
+    if any(k in message for k in (
+        "forward_origin", "forward_date", "forward_from",
+        "forward_from_chat", "forward_sender_name",
+    )):
+        with BOWLING_LOCK:
+            token = user_active_bowling.get(user_id)
+            has_active = token is not None and active_bowling_games.get(token, {}).get("status") in ("awaiting_p1", "awaiting_p2")
+        if has_active:
+            send_message(chat_id, f"{WARN_EMOJI} That's a forwarded throw, not a live roll. Send a fresh {BOWLING_EMOJI} to bowl for real.")
+        return False
+
+    with BOWLING_LOCK:
+        token = user_active_bowling.get(user_id)
+        if not token:
+            return False
+        game = active_bowling_games.get(token)
+        if not game or game["chat_id"] != chat_id:
+            return False
+
+        is_p1 = (game["p1_id"] == user_id)
+        if is_p1 and game["status"] != "awaiting_p1":
+            return False
+        if not is_p1 and (game["p2_id"] != user_id or game["status"] != "awaiting_p2"):
+            return False
+
+        if is_p1:
+            game["p1_rolls"].append(dice["value"])
+            side_done = len(game["p1_rolls"]) >= game["rounds"]
+            remaining = game["rounds"] - len(game["p1_rolls"])
+        else:
+            game["p2_rolls"].append(dice["value"])
+            side_done = len(game["p2_rolls"]) >= game["rounds"]
+            remaining = game["rounds"] - len(game["p2_rolls"])
+
+        if side_done:
+            if is_p1 and game["mode"] != "pvp":
+                game["status"] = "bot_throwing"
+            elif is_p1:
+                game["status"] = "awaiting_p2"
+            else:
+                game["status"] = "settling"
+
+    if not side_done:
+        send_message(chat_id, f"{BOWLING_EMOJI} Got it! {remaining} more throw{'s' if remaining > 1 else ''} to go.")
+        return True
+
+    if is_p1 and game["mode"] != "pvp":
+        _bowling_run_bot_throws(game)
+        return True
+
+    if is_p1:  # PvP: p1 (challenger) just finished, now p2 (joiner) throws
+        send_message(
+            chat_id,
+            f"{BOWLING_EMOJI} {mention(game['p1_id'], game['p1_name'])} is done! Total: <b>{sum(game['p1_rolls'])}</b>\n\n"
+            f"{mention(game['p2_id'], game['p2_name'])}, your turn — send the {BOWLING_EMOJI} bowling emoji, "
+            f"you need <b>{game['rounds']}</b> throw{'s' if game['rounds'] > 1 else ''}!"
+        )
+        return True
+
+    _bowling_settle(game)
+    return True
+
+
+def _bowling_settle(game):
+    chat_id, mode, amount = game["chat_id"], game["mode"], game["amount"]
+    p1_id, p1_name, p1_rolls = game["p1_id"], game["p1_name"], game["p1_rolls"]
+    p2_id, p2_name, p2_rolls = game["p2_id"], game["p2_name"], game["p2_rolls"]
+    vs_bot = mode != "pvp"
+
+    with BOWLING_LOCK:
+        active_bowling_games.pop(game["token"], None)
+        user_active_bowling.pop(p1_id, None)
+        if p2_id:
+            user_active_bowling.pop(p2_id, None)
+
+    p1_total = sum(p1_rolls)
+    p2_total = sum(p2_rolls)
+    p1_faces = " ".join(f"{BOWLING_EMOJI}{r}" for r in p1_rolls)
+    p2_faces = " ".join(f"{BOWLING_EMOJI}{r}" for r in p2_rolls)
+    p2_label = "🤖 Helper Bot" if vs_bot else mention(p2_id, p2_name)
+    pretty = BOWLING_MODE_LABEL[mode]
+
+    lines = (
+        f"{BOWLING_EMOJI} <b>Bowling {pretty} Result</b>\n\n"
+        f"{mention(p1_id, p1_name)}: {p1_faces}  (total <b>{p1_total}</b>)\n"
+        f"{p2_label}: {p2_faces}  (total <b>{p2_total}</b>)\n\n"
+    )
+
+    tie = p1_total == p2_total
+    p1_wins = (p1_total < p2_total) if mode == "crazy" else (p1_total > p2_total)
+
+    if tie:
+        adjust_balance(p1_id, amount)
+        if not vs_bot:
+            adjust_balance(p2_id, amount)
+        record_bet_result(p1_id, p1_name, "Bowling", amount, amount)
+        if not vs_bot:
+            record_bet_result(p2_id, p2_name, "Bowling", amount, amount)
+        send_message(chat_id, lines + f"🤝 Tie! Bet{'s' if not vs_bot else ''} refunded.")
+        return
+
+    payout = round(amount * BOWLING_PAYOUT, 2)
+
+    if vs_bot:
+        record_bet_result(p1_id, p1_name, "Bowling", amount, payout if p1_wins else 0.0)
+        if p1_wins:
+            adjust_balance(p1_id, payout)
+            new_balance = get_balance(p1_id)
+            send_message(chat_id, lines + f"🏆 You win! Payout: <b>{fmt_money(p1_id, payout)}</b>\nBalance: <b>{fmt_money(p1_id, new_balance)}</b>")
+        else:
+            new_balance = get_balance(p1_id)
+            send_message(chat_id, lines + f"❌ Bot wins. Lost: <b>{fmt_money(p1_id, amount)}</b>\nBalance: <b>{fmt_money(p1_id, new_balance)}</b>")
+        return
+
+    record_bet_result(p1_id, p1_name, "Bowling", amount, payout if p1_wins else 0.0)
+    record_bet_result(p2_id, p2_name, "Bowling", amount, payout if not p1_wins else 0.0)
+    if p1_wins:
+        adjust_balance(p1_id, payout)
+        winner_id, winner_name, loser_id, loser_name = p1_id, p1_name, p2_id, p2_name
+    else:
+        adjust_balance(p2_id, payout)
+        winner_id, winner_name, loser_id, loser_name = p2_id, p2_name, p1_id, p1_name
+    send_message(
+        chat_id,
+        lines + f"🏆 {mention(winner_id, winner_name)} wins <b>{fmt_money(winner_id, payout)}</b>!\n"
+        f"{mention(loser_id, loser_name)} lost <b>{fmt_money(loser_id, amount)}</b>."
+    )
+
+
+# ---------------------------------------------------------------------------
 # DB SYNC — every active-game dict in this file (Mines/Towers/Keno are
 # keyed by user_id; Crash/Blackjack/Dice/ChickenRoad are keyed by a token,
 # with a companion user_id->token pointer dict) gets periodically snapshotted
@@ -8930,6 +9330,7 @@ def main():
             {"command": "luckyroll", "description": "Play Lucky Roll (dice)"},
             {"command": "diceroll", "description": "Real 🎲 dice games: OE/HL/1v1/Crazy/Predict"},
             {"command": "dice", "description": "Dice Battle: N dice each vs a helper bot, highest total wins"},
+            {"command": "bowling", "description": "Bowling: Classic/Crazy/PvP, most pins wins"},
             {"command": "crash", "description": "Play Crash"},
             {"command": "chickenroad", "description": "Play Chicken Road"},
             {"command": "roulette", "description": "Play Roulette"},
